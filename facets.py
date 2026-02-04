@@ -2,6 +2,7 @@ import aiofiles
 import argparse
 import asyncio
 import collections
+import dataclasses
 import git
 import itertools
 import math
@@ -13,40 +14,59 @@ import scipy
 import sklearn
 import tiktoken
 
+from git import Repo
+from numpy import float32
+from numpy.typing import NDArray
+from openai import AsyncOpenAI
+from tiktoken import Encoding
+from typing import Generator, List
 max_tokens_per_embed = 8192
 
 max_tokens_per_batch_embed = 300000
 
-async def main():
-    parser = argparse.ArgumentParser(
-      prog='facets',
-      description='Cluster documents by semantic facets',
-    )
+@dataclasses.dataclass(frozen=True)
+class Facets:
+    openai_client: AsyncOpenAI
+    embedding_model: str
+    completion_model: str
+    embedding_encoding: Encoding
+    completion_encoding: Encoding
 
-    parser.add_argument('repository')
-
-    arguments = parser.parse_args()
-
-    repository = git.Repo(arguments.repository)
+def initialize() -> Facets:
+    openai_client = AsyncOpenAI()
 
     embedding_model = "text-embedding-3-large"
 
     completion_model = "gpt-5.2"
 
-    openai_client = openai.AsyncOpenAI()
-
     embedding_encoding = tiktoken.encoding_for_model(embedding_model)
 
     completion_encoding = tiktoken.get_encoding("o200k_base")
 
-    # This value was chosen based on hand-testing of what gave the best balance
-    # of performance and reliability
-    semaphore = asyncio.Semaphore(148)
+    return Facets(
+        openai_client = openai_client,
+        embedding_model = embedding_model,
+        completion_model = completion_model,
+        embedding_encoding = embedding_encoding,
+        completion_encoding = completion_encoding
+    )
 
-    print("[+] Reading files")
+@dataclasses.dataclass(frozen=True)
+class Embed:
+    entry: str
+    embedding: NDArray[float32]
+
+@dataclasses.dataclass(frozen=True)
+class Cluster:
+    embeds: List[Embed]
+
+async def embed(facets: Facets, repository: str) -> Cluster:
+    print("[+] Embedding files")
+
+    repo = Repo(repository)
 
     async def read(entry):
-        absolute_path = os.path.join(arguments.repository, entry)
+        absolute_path = os.path.join(repository, entry)
 
         try:
             async with aiofiles.open(absolute_path, "rb") as handle:
@@ -56,12 +76,12 @@ async def main():
 
                 annotated = f"{entry}:\n\n{text}"
 
-                tokens = embedding_encoding.encode(annotated)
+                tokens = facets.embedding_encoding.encode(annotated)
 
                 # TODO: chunk instead of truncate
                 truncated = tokens[:max_tokens_per_embed]
 
-                return [ (entry, embedding_encoding.decode(truncated)) ]
+                return [ (entry, facets.embedding_encoding.decode(truncated)) ]
 
         except UnicodeDecodeError:
             # Ignore documents that aren't UTF-8
@@ -77,25 +97,28 @@ async def main():
             # handled
             return [ ]
 
-    results = list(itertools.chain.from_iterable(await asyncio.gather(*(read(entry) for entry, _ in repository.index.entries))))
+    results = list(itertools.chain.from_iterable(await asyncio.gather(*(read(entry) for entry, _ in repo.index.entries))))
 
     entries, contents = zip(*results)
 
-    print("[+] Embedding file contents")
-
     max_embeds = math.floor(max_tokens_per_batch_embed / max_tokens_per_embed)
 
-    async def embed(input):
-        response = await openai_client.embeddings.create(
-          model=embedding_model,
+    async def embed_batch(input):
+        response = await facets.openai_client.embeddings.create(
+          model=facets.embedding_model,
           input=input
         )
 
-        return [ datum.embedding for datum in response.data ]
+        return [ numpy.asarray(datum.embedding, float32) for datum in response.data ]
 
-    embeddings = list(itertools.chain.from_iterable(await asyncio.gather(*(embed(input) for input in itertools.batched(contents, max_embeds)))))
+    embeddings = list(itertools.chain.from_iterable(await asyncio.gather(*(embed_batch(input) for input in itertools.batched(contents, max_embeds)))))
 
+    return Cluster([ Embed(entry, embedding) for entry, embedding in zip(entries, embeddings) ])
+
+def cluster(input: Cluster) -> List[Cluster]:
     print("[+] Clustering embeddings")
+
+    entries, embeddings = zip(*((embed.entry, embed.embedding) for embed in input.embeds))
 
     N = len(embeddings)
 
@@ -235,61 +258,80 @@ async def main():
     groups = collections.OrderedDict()
 
     for (label, entry, vector) in zip(labels, entries, full_embedding):
-        groups.setdefault(label, []).append((entry, vector))
+        groups.setdefault(label, []).append(Embed(entry, vector))
 
+    return [ Cluster(embeds) for embeds in groups.values() ]
+
+def render_cluster(cluster):
+    def key(embed):
+        return scipy.linalg.norm(embed.embedding)
+
+    entries = [ embed.entry for embed in sorted(cluster.embeds, reverse=True, key=key) ]
+
+    desired_entries = 403
+
+    step = math.ceil(len(entries) / desired_entries)
+
+    entries = entries[::step]
+
+    extra_files = len(cluster.embeds) - len(entries)
+    if extra_files > 0:
+        entries.append(f"… [{extra_files} more files]")
+
+    return "\n".join(sorted(entries))
+
+async def label_cluster(facets: Facets, clusters: List[Cluster]) -> List[str]:
     print("[+] Labeling clusters")
-    def render_group(values):
-        def key(value):
-            _, vector = value
 
-            return scipy.linalg.norm(vector)
+    async def label(my_index, my_cluster):
+        other_cluster = Cluster([
+            embed
+            for other_index, other_cluster in enumerate(clusters)
+            if my_index != other_index
+            for embed in other_cluster.embeds
+        ])
 
-        entries = [ entry for entry, vector in sorted(values, reverse=True, key=key) ]
+        prompt = f"Vector embedding plus clustering produced the following cluster of files:\n\n{render_cluster(my_cluster)}\n\nDescribe in a few words what distinguishes that cluster of files from these other files in the project that don't belong to that cluster:\n\n{render_cluster(other_cluster)}\n\nYour response in its entirety should be a succinct description (≈3 words) without any explanation/context/rationale because the full text of what you say will be used as the user-facing cluster label without any trimming"
 
-        desired_entries = 403
-
-        step = math.ceil(len(entries) / desired_entries)
-
-        entries = entries[::step]
-
-        extra_files = len(values) - len(entries)
-        if extra_files > 0:
-            entries.append(f"… [{extra_files} more files]")
-
-        return "\n".join(sorted(entries))
-
-    async def label(item):
-        my_label, my_values = item
-
-        other_values = [
-            value
-            for other_label, other_values in groups.items()
-            if my_label != other_label
-            for value in other_values
-        ]
-
-        prompt = f"Vector embedding plus clustering produced the following cluster of files:\n\n{render_group(my_values)}\n\nDescribe in a few words what distinguishes that cluster of files from these other files in the project that don't belong to that cluster:\n\n{render_group(other_values)}\n\nYour response in its entirety should be a succinct description (≈3 words) without any explanation/context/rationale because the full text of what you say will be used as the user-facing cluster label without any trimming"
-
-        tokens = completion_encoding.encode(prompt)
+        tokens = facets.completion_encoding.encode(prompt)
 
         truncated = tokens[:128000]
 
-        input = completion_encoding.decode(truncated)
+        input = facets.completion_encoding.decode(truncated)
 
-        summary = await openai_client.responses.create(model = completion_model, input = input)
+        summary = await facets.openai_client.responses.create(model = facets.completion_model, input = input)
 
-        return summary.output_text, render_group(my_values)
+        return summary.output_text
 
-    results = await asyncio.gather(*(label(item) for item in groups.items()))
+    results = await asyncio.gather(*(label(my_index, my_cluster) for my_index, my_cluster in enumerate(clusters)))
+
+    return results
+
+async def main():
+    parser = argparse.ArgumentParser(
+        prog='facets',
+        description='Cluster documents by semantic facets',
+    )
+
+    parser.add_argument('repository')
+    arguments = parser.parse_args()
+
+    facets = initialize()
+
+    initial_cluster = await embed(facets, arguments.repository)
+
+    sub_clusters = cluster(initial_cluster)
+
+    labels = await label_cluster(facets, sub_clusters)
 
     print("")
 
-    for summary, entries in results:
-        print(f"# {summary}")
+    for label, c in zip(labels, sub_clusters):
+        print(f"# {label}")
 
         print("")
 
-        print(entries)
+        print(render_cluster(c))
 
         print("")
 
