@@ -327,7 +327,10 @@ async def tree(facets: Facets, label: str, c: Cluster):
 
     children = await asyncio.gather(*(tree(facets, label, sub_cluster) for label, sub_cluster in zip(labels, sub_clusters)))
 
-    children.append(Tree("[Files]", files))
+    if not children:
+        children = files
+    else:
+        children = [ Tree("[Files]", files) ] + children
 
     return Tree(label, children)
 
