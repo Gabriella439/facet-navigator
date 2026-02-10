@@ -347,7 +347,6 @@ async def label_leaves(facets: Facets, c: Cluster) -> list[Tree]:
         response = await facets.openai_client.responses.create(
             model = facets.completion_model,
             input = input,
-            max_output_tokens = 16,
             temperature = 0
         )
 
