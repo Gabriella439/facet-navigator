@@ -284,6 +284,33 @@ def zipper(elements: list[A]) -> list[tuple[list[A], A, list[A]]]:
         for index, element in enumerate(elements)
     ]
 
+
+def to_pattern(files):
+    prefix = os.path.commonprefix(files)
+    suffix = os.path.commonprefix([ file[len(prefix):][::-1] for file in files ])[::-1]
+
+    if suffix:
+        if any([ file[len(prefix):-len(suffix)] for file in files ]):
+            star = "*"
+        else:
+            star = ""
+    else:
+        if any([ file[len(prefix):] for file in files ]):
+            star = "*"
+        else:
+            star = ""
+
+    if prefix:
+        if suffix:
+            return f"{prefix}{star}{suffix}: "
+        else:
+            return f"{prefix}{star}: "
+    else:
+        if suffix:
+            return f"{star}{suffix}: "
+        else:
+            return ""
+
 async def label_leaves(facets: Facets, c: Cluster) -> list[Tree]:
     async def label(element: tuple[list[Embed], Embed, list[Embed]]) -> Tree:
         prefix, embed, suffix = element
@@ -297,14 +324,16 @@ async def label_leaves(facets: Facets, c: Cluster) -> list[Tree]:
 
         input = f"Describe in a few words what distinguishes this file:\n\n{here}\n\n… from these other files:\n\n{other}\n\nYour response in its entirety should be a succinct description (≈3 words) without any explanation/context/rationale because the full text of what you say will be used as the file label without any trimming."
 
-        response = await facets.openai_client.responses.create(
+        response = await facets.openai_client.chat.completions.create(
             model = facets.completion_model,
-            input = input
+            messages = [ { "role": "user", "content": input } ],
+            temperature = 0,
+            seed = 0
         )
 
         files = [ embed.entry ]
 
-        return Tree(response.output_text, files, [])
+        return Tree(f"{embed.entry}: {response.choices[0].message.content}", files, [])
 
     return await asyncio.gather(*(label(tuple) for tuple in zipper(c.embeds)))
 
@@ -324,14 +353,18 @@ async def label_nodes(facets: Facets, c: Cluster) -> list[Tree]:
 
             input = f"Describe in a few words what distinguish this cluster:\n\n{here}\n\n… from these other clusters:\n\n{other}\n\nYour response in its entirety should be a succinct description (≈3 words) without any explanation/context/rationale because the full text of what you say will be used as the file label without any trimming."
 
-            response = await facets.openai_client.responses.create(
+            response = await facets.openai_client.chat.completions.create(
                 model = facets.completion_model,
-                input = input
+                messages = [ { "role": "user", "content": input } ],
+                temperature = 0,
+                seed = 0
             )
 
             files = [ file for child in children for file in child.files ]
 
-            return Tree(response.output_text, files, children)
+            pattern = to_pattern(files)
+
+            return Tree(f"{pattern}{response.choices[0].message.content}", files, children)
 
         children = cluster(c)
 
@@ -355,36 +388,11 @@ class UI(textual.app.App):
         self.treeview = textual.widgets.Tree(f"{self.tree_.label} ({len(self.tree_.files)})")
         def loop(node, files, children):
             for child in children:
-                prefix = os.path.commonprefix(child.files)
-                suffix = os.path.commonprefix([ file[len(prefix):][::-1] for file in child.files ])[::-1]
-
-                if suffix:
-                    if any([ file[len(prefix):-len(suffix)] for file in child.files ]):
-                        star = "*"
-                    else:
-                        star = ""
-                else:
-                    if any([ file[len(prefix):] for file in child.files ]):
-                        star = "*"
-                    else:
-                        star = ""
-
-                if prefix:
-                    if suffix:
-                        pattern = f"{prefix}{star}{suffix}: "
-                    else:
-                        pattern = f"{prefix}{star}: "
-                else:
-                    if suffix:
-                        pattern = f"{star}{suffix}: "
-                    else:
-                        pattern = ""
-
                 if len(child.files) <= 1:
-                    n = node.add(f"{pattern}{child.label}")
+                    n = node.add(child.label)
                     n.allow_expand = False
                 else:
-                    n = node.add(f"{pattern}{child.label} ({len(child.files)})")
+                    n = node.add(f"{child.label} ({len(child.files)})")
                     n.allow_expand = True
 
                     loop(n, child.files, child.children)
