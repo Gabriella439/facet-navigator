@@ -22,7 +22,7 @@ from numpy import float32
 from numpy.typing import NDArray
 from openai import AsyncOpenAI
 from tiktoken import Encoding
-from typing import TypeVar
+from typing import Iterable, TypeVar
 
 max_tokens_per_embed = 8192
 
@@ -72,26 +72,30 @@ async def embed(facets: Facets, repository: str) -> Cluster:
 
     repo = Repo(repository)
 
-    async def read(entry):
-        absolute_path = os.path.join(repository, entry)
+    async def read(path):
+        absolute_path = os.path.join(repository, path)
 
         try:
             async with aiofiles.open(absolute_path, "rb") as handle:
+                annotation = f"{path}:\n\n"
+
                 bytestring = await handle.read()
 
                 text = bytestring.decode("utf-8")
 
-                annotated = f"{entry}:\n\n{text}"
+                annotation_tokens = facets.embedding_encoding.encode(annotation)
+                text_tokens       = facets.embedding_encoding.encode(text)
 
-                tokens = facets.embedding_encoding.encode(annotated)
+                max_tokens_per_chunk = max_tokens_per_embed - len(annotation_tokens)
 
-                # TODO: chunk instead of truncate
-                truncated = tokens[:max_tokens_per_embed]
+                return [
+                    (path, facets.embedding_encoding.decode(annotation_tokens + list(chunk)))
 
-                return [ (entry, facets.embedding_encoding.decode(truncated)) ]
+                    for chunk in itertools.batched(text_tokens, max_tokens_per_chunk)
+                ]
 
         except UnicodeDecodeError:
-            # Ignore documents that aren't UTF-8
+            # Ignore files that aren't UTF-8
             return [ ]
 
         except IsADirectoryError:
@@ -104,23 +108,36 @@ async def embed(facets: Facets, repository: str) -> Cluster:
             # handled
             return [ ]
 
-    results = list(itertools.chain.from_iterable(await asyncio.gather(*(read(entry) for entry, _ in repo.index.entries))))
+    tasks = [ read(path) for path, _ in repo.index.entries ]
 
-    entries, contents = zip(*results)
+    results = list(itertools.chain.from_iterable(await asyncio.gather(*tasks)))
+
+    paths, contents = zip(*results)
 
     max_embeds = math.floor(max_tokens_per_batch_embed / max_tokens_per_embed)
 
     async def embed_batch(input):
         response = await facets.openai_client.embeddings.create(
-          model=facets.embedding_model,
-          input=input
+            model=facets.embedding_model,
+            input=input
         )
 
-        return [ numpy.asarray(datum.embedding, float32) for datum in response.data ]
+        return [
+            numpy.asarray(datum.embedding, float32) for datum in response.data
+        ]
 
-    embeddings = list(itertools.chain.from_iterable(await asyncio.gather(*(embed_batch(input) for input in itertools.batched(contents, max_embeds)))))
+    tasks = [
+        embed_batch(input) for input in itertools.batched(contents, max_embeds)
+    ]
 
-    return Cluster([ Embed(entry, content, embedding) for entry, content, embedding in zip(entries, contents, embeddings) ])
+    embeddings = list(itertools.chain.from_iterable(await asyncio.gather(*tasks)))
+
+    embeds = [
+        Embed(path, content, embedding)
+        for path, content, embedding in zip(paths, contents, embeddings)
+    ]
+
+    return Cluster(embeds)
 
 def cluster(input: Cluster) -> list[Cluster]:
     print("[+] Clustering embeddings")
