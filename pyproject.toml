@@ -8,6 +8,7 @@ dependencies = [
     "aiofiles",
     "gitpython",
     "openai[aiohttp]",
+    "pydantic",
     "scikit-learn",
     "textual",
     "tiktoken",
