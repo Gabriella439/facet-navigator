@@ -26,7 +26,7 @@ max_tokens_per_embed = 8192
 
 max_tokens_per_batch_embed = 300000
 
-max_leaves = 7
+max_leaves = 20
 
 max_clusters = 20
 
@@ -363,7 +363,7 @@ async def label_nodes(facets: Facets, c: Cluster) -> list[Tree]:
 
         rendered_embeds = "\n\n".join([ render_embed(embed) for embed in c.embeds ])
 
-        input = f"Describe in ≈3 words what distinguishes each one of these files from the other files.  Don't include the file path/name in the description.\n\n{rendered_embeds}"
+        input = f"Describe each file in 3 to 7 words.  Don't include file path/names in descriptions.\n\n{rendered_embeds}"
 
         response = await facets.openai_client.responses.parse(
             model = facets.completion_model,
@@ -397,7 +397,7 @@ async def label_nodes(facets: Facets, c: Cluster) -> list[Tree]:
 
         rendered_clusters = "\n\n".join([ render_cluster(trees) for trees in treess ])
 
-        input = f"Describe in ≈3 words what distinguishes each one of these clusters from the other clusters:\n\n{rendered_clusters}"
+        input = f"Describe each cluster in 2 words.\n\n{rendered_clusters}"
 
         response = await facets.openai_client.responses.parse(
             model = facets.completion_model,
