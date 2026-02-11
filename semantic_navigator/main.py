@@ -28,6 +28,8 @@ max_tokens_per_batch_embed = 300000
 
 max_leaves = 7
 
+max_clusters = 20
+
 @dataclass(frozen = True)
 class Facets:
     openai_client: AsyncOpenAI
@@ -120,6 +122,9 @@ async def embed(facets: Facets, repository: str) -> Cluster:
 
     results = list(itertools.chain.from_iterable(await tasks))
 
+    if not results:
+        return Cluster([])
+
     paths, contents = zip(*results)
 
     max_embeds = math.floor(max_tokens_per_batch_embed / max_tokens_per_embed)
@@ -154,21 +159,32 @@ def cluster(input: Cluster) -> list[Cluster]:
     if len(input.embeds) <= max_leaves:
         return []
 
-    entries, contents, embeddings = zip(*((embed.entry, embed.content, embed.embedding) for embed in input.embeds))
+    entries, contents, embeddings = zip(*(
+        (embed.entry, embed.content, embed.embedding)
+        for embed in input.embeds
+    ))
 
     N = len(embeddings)
 
+    # The following code computes an affinity matrix using a radial basis
+    # function with an adaptive adaptive σ.  See:
+    #
+    #     L. Zelnik-Manor, P. Perona (2004), "Self-Tuning Spectral Clustering"
+
     normalized = sklearn.preprocessing.normalize(embeddings)
 
-    # Find the smallest value for `n_neighbors` that produces one connected
-    # component under nearest neighbors
+    # The original paper suggests setting K (`n_neighbors`) to 7.  Here we do
+    # something a little fancier and try to find a low value of `n_neighbors`
+    # that produces one connected component.  This usually ends up being around
+    # 7 anyway.
     #
-    # If we pick a value of `n_neighbors` that is too small and build an
-    # affinity matrix from the corresponding nearest_neighbors matrix then
-    # spectral clustering is only going to identify clusters found by the
-    # nearest neighbors algorithm, which is not what we want. We only want the
-    # nearest neighbors algorithm to weakly inform the choice of radius for the
-    # radial-basis function.
+    # The reason we want to avoid multiple connected components is because if
+    # we have more than one connected component then those connected components
+    # will dominate the clusters suggested by spectral cluster.  We don't want
+    # that because we don't want spectral clustering to degenerate to the same
+    # result as K nearest neighbors.  We want the K nearest neighbors algorithm
+    # to weakly inform the spectral clustering algorithm without dominating the
+    # result.
     def get_nearest_neighbors(n_neighbors):
         nearest_neighbors = sklearn.neighbors.NearestNeighbors(
             n_neighbors = n_neighbors,
@@ -186,52 +202,51 @@ def cluster(input: Cluster) -> list[Cluster]:
 
         return components, n_neighbors, nearest_neighbors
 
-    candidate_neighbor_counts = itertools.takewhile(
+    # We don't attempt to find the absolute lowest value of K (`n_neighbors`).
+    # Instead we just sample a few values and pick a "small enough" one.
+    candidate_neighbor_counts = list(itertools.takewhile(
         lambda x: x < N,
         (round(math.exp(n)) for n in itertools.count())
-    )
+    )) + [ math.ceil(N / 2) ]
 
     results = [
         get_nearest_neighbors(n_neighbors)
-        for n_neighbors in list(candidate_neighbor_counts) + [ N - 1 ]
+        for n_neighbors in candidate_neighbor_counts
     ]
 
+    # Find the first sample value of K (`n_neighbors`) that produces one
+    # connected component.  There's guaranteed to be at least one since the
+    # very last value we sample (⌈N/2⌉) always produces one connected
+    # component.
     n_neighbors, nearest_neighbors = [
         (n_neighbors, nearest_neighbors)
         for components, n_neighbors, nearest_neighbors in results
         if components == 1
     ][0]
 
-    # Compute an adaptive sigma for our radial basis function based on
-    # neighborhood size.  See:
-    #
-    #     Fischer, I., & Poland, J. (2004). New methods for spectral clustering.
-    #     Technical Report No. IDSIA-12-04, Dalle Molle Institute for
-    #     Artificial Intelligence, Manno-Lugano, Switzerland.
     distances, indices = nearest_neighbors.kneighbors(normalized)
 
+    # sigmas[i] = the distance of semantic embedding #i to its Kth nearest
+    # neighbor
     sigmas = distances[:, -1]
 
-    rows = numpy.repeat(numpy.arange(N), n_neighbors)
+    rows    = numpy.repeat(numpy.arange(N), n_neighbors)
     columns = indices.reshape(-1)
+
     d = distances.reshape(-1)
 
     sigma_i = numpy.repeat(sigmas, n_neighbors)
     sigma_j = sigmas[columns]
 
     denominator = numpy.maximum(sigma_i * sigma_j, 1e-12)
-
     data = numpy.exp(-(d * d) / denominator).astype(numpy.float32)
 
-    similarities = scipy.sparse.coo_matrix((data, (rows, columns)), shape = (N, N)).tocsr()
+    # Affinity: A_ij = exp(-d(x_i, x_j)^2 / (σ_i σ_j))
+    affinity = scipy.sparse.coo_matrix((data, (rows, columns)), shape = (N, N)).tocsr()
 
-    affinity = (similarities + similarities.T) * 0.5
+    affinity = (affinity + affinity.T) * 0.5
     affinity.setdiag(1.0)
     affinity.eliminate_zeros()
-
-    # This is basically `sklearn.manifold.spectral_embedding`, but exploded
-    # out so that we can get access to the eigenvalues, which are normally not
-    # exposed by the function.  We'll need those eigenvalues later
 
     # This is actually the *maximum* number of clusters that the algorithm can
     # return.
@@ -239,14 +254,18 @@ def cluster(input: Cluster) -> list[Cluster]:
     # The algorithm is actually fast enough to return a much larger number of
     # clusters and sometimes you find much more optimal clusterings at much
     # higher cluster counts.  For example, I've seen repositories where the
-    # optimal cluster count was 600+.  However, we cap the maximum cluster
-    # count at 20 because we don't want to present more than that many choices
-    # to the user at any level of the decision tree.  Ideally we present around
-    # ≈7 choices but capping at 20 is just being conservative.
+    # optimal cluster count was 600+ (and the results were indeed good based on
+    # visual inspection).  However, we cap the maximum cluster count to avoid
+    # presenting too many clusters to the user at any level of the decision
+    # tree.
     #
-    # As a bonus, capping at 20 improves performance, too.
-    n_clusters = min(N - 1, 20)
+    # As a bonus, capping the cluster count improves performance, too.
+    n_clusters = min(N - 1, max_clusters)
 
+    # The following code is basically `sklearn.manifold.spectral_embeddings`,
+    # but exploded out so that we can get access to the eigenvalues, which are
+    # normally not exposed by the function.  We'll need those eigenvalues
+    # later.
     random_state = sklearn.utils.check_random_state(0)
 
     laplacian, dd = scipy.sparse.csgraph.laplacian(
@@ -270,12 +289,14 @@ def cluster(input: Cluster) -> list[Cluster]:
         tol = 0.0,
         v0 = v0
     )
-    full_embedding = eigenvectors.T[n_clusters::-1] * dd
-    full_embedding = sklearn.utils.extmath._deterministic_vector_sign_flip(full_embedding)
-    full_embedding = full_embedding[1:n_clusters].T
+    wide_spectral_embeddings = eigenvectors.T[n_clusters::-1] * dd
+    wide_spectral_embeddings = sklearn.utils.extmath._deterministic_vector_sign_flip(wide_spectral_embeddings)
+    wide_spectral_embeddings = wide_spectral_embeddings[1:n_clusters].T
     eigenvalues = eigenvalues[n_clusters::-1]
     eigenvalues *= -1
 
+    # Find the optimal cluster count by looking for the largest eigengap
+    #
     # The reason the suggested cluster count is not just:
     #
     #     numpy.argmax(numpy.diff(eigenvalues))
@@ -283,20 +304,20 @@ def cluster(input: Cluster) -> list[Cluster]:
     # … is because we want at least two clusters (otherwise what's the point?).
     n_clusters = numpy.argmax(numpy.diff(eigenvalues)[2:]) + 2
 
-    embedding = full_embedding[:, :n_clusters]
+    spectral_embeddings = wide_spectral_embeddings[:, :n_clusters]
 
-    normalized_embedding = sklearn.preprocessing.normalize(embedding)
+    spectral_embeddings = sklearn.preprocessing.normalize(spectral_embeddings)
 
     labels = sklearn.cluster.KMeans(
         n_clusters = n_clusters,
         random_state = 0,
         n_init = "auto"
-    ).fit_predict(normalized_embedding)
+    ).fit_predict(spectral_embeddings)
 
     groups = collections.OrderedDict()
 
-    for (label, entry, content, vector) in zip(labels, entries, contents, full_embedding):
-        groups.setdefault(label, []).append(Embed(entry, content, vector))
+    for (label, entry, content, spectral_embedding) in zip(labels, entries, contents, spectral_embeddings):
+        groups.setdefault(label, []).append(Embed(entry, content, spectral_embedding))
 
     return [ Cluster(embeds) for embeds in groups.values() ]
 
@@ -332,7 +353,6 @@ def to_pattern(files):
         else:
             return ""
 
-@dataclass(frozen = True)
 class Labels(BaseModel):
     labels: list[str]
 
@@ -353,6 +373,8 @@ async def label_nodes(facets: Facets, c: Cluster) -> list[Tree]:
 
         assert response.output_parsed is not None
 
+        # assert len(response.output_parsed.labels) == len(c.embeds)
+
         return [
             Tree(f"{embed.entry}: {label}", [ embed.entry ], [])
             for label, embed in zip(response.output_parsed.labels, c.embeds)
@@ -369,7 +391,9 @@ async def label_nodes(facets: Facets, c: Cluster) -> list[Tree]:
         )
 
         def render_cluster(trees: list[Tree]) -> str:
-            return f"# Cluster\n\n{"\n".join([ tree.label for tree in trees ])}"
+            rendered_trees = "\n".join([ tree.label for tree in trees ])
+
+            return f"# Cluster\n\n{rendered_trees}"
 
         rendered_clusters = "\n\n".join([ render_cluster(trees) for trees in treess ])
 
@@ -382,6 +406,8 @@ async def label_nodes(facets: Facets, c: Cluster) -> list[Tree]:
         )
 
         assert response.output_parsed is not None
+
+        # assert len(response.output_parsed.labels) == len(children)
 
         def to_files(trees: list[Tree]) -> list[str]:
             return [
