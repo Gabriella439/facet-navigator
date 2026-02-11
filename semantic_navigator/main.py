@@ -367,7 +367,7 @@ def to_pattern(files):
 class Labels(BaseModel):
     labels: list[str]
 
-async def label_nodes(facets: Facets, c: Cluster) -> list[Tree]:
+async def label_nodes(facets: Facets, c: Cluster, depth: int) -> list[Tree]:
     children = cluster(c)
 
     if len(children) == 1:
@@ -394,12 +394,17 @@ async def label_nodes(facets: Facets, c: Cluster) -> list[Tree]:
         ]
 
     else:
-        treess = await tqdm_asyncio.gather(
-            *(label_nodes(facets, child) for child in children),
-            desc = "Labeling clusters",
-            unit = "cluster",
-            leave = False
-        )
+        if depth == 0:
+            treess = await tqdm_asyncio.gather(
+                *(label_nodes(facets, child, depth + 1) for child in children),
+                desc = "Labeling clusters",
+                unit = "cluster",
+                leave = False
+            )
+        else:
+            treess = await asyncio.gather(
+                *(label_nodes(facets, child, depth + 1) for child in children),
+            )
 
         def render_cluster(trees: list[Tree]) -> str:
             rendered_trees = "\n".join([ tree.label for tree in trees ])
@@ -433,7 +438,7 @@ async def label_nodes(facets: Facets, c: Cluster) -> list[Tree]:
         ]
 
 async def tree(facets: Facets, label: str, c: Cluster) -> Tree:
-    children = await label_nodes(facets, c)
+    children = await label_nodes(facets, c, 0)
 
     files = [ file for child in children for file in child.files ]
 
