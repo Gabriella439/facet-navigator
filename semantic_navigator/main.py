@@ -15,16 +15,13 @@ import tiktoken
 
 from dataclasses import dataclass
 from git import Repo
+from itertools import batched, chain
 from numpy import float32
 from numpy.typing import NDArray
 from pydantic import BaseModel
 from openai import AsyncOpenAI
 from tiktoken import Encoding
 from tqdm.asyncio import tqdm_asyncio
-
-max_tokens_per_embed = 8192
-
-max_tokens_per_batch_embed = 300000
 
 max_clusters = 20
 
@@ -68,6 +65,10 @@ class Embed:
 class Cluster:
     embeds: list[Embed]
 
+max_tokens_per_embed = 8192
+
+max_tokens_per_batch_embed = 300000
+
 async def embed(facets: Facets, repository: str) -> Cluster:
     repo = Repo(repository)
 
@@ -94,7 +95,7 @@ async def embed(facets: Facets, repository: str) -> Cluster:
                     # GPT has trouble labeling chunks in order when multiple
                     # chunks have the same file name.  Remove the `[:1]` when
                     # this is fixed.
-                    for chunk in list(itertools.batched(text_tokens, max_tokens_per_chunk))[:1]
+                    for chunk in list(batched(text_tokens, max_tokens_per_chunk))[:1]
                 ]
 
         except UnicodeDecodeError:
@@ -118,7 +119,7 @@ async def embed(facets: Facets, repository: str) -> Cluster:
         leave = False
     )
 
-    results = list(itertools.chain.from_iterable(await tasks))
+    results = list(chain.from_iterable(await tasks))
 
     if not results:
         return Cluster([])
@@ -138,13 +139,13 @@ async def embed(facets: Facets, repository: str) -> Cluster:
         ]
 
     tasks = tqdm_asyncio.gather(
-        *(embed_batch(input) for input in itertools.batched(contents, max_embeds)),
+        *(embed_batch(input) for input in batched(contents, max_embeds)),
         desc = "Embedding contents",
         unit = "batch",
         leave = False
     )
 
-    embeddings = list(itertools.chain.from_iterable(await tasks))
+    embeddings = list(chain.from_iterable(await tasks))
 
     embeds = [
         Embed(path, content, embedding)
