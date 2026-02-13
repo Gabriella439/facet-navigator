@@ -14,10 +14,12 @@ import textual.widgets
 import tiktoken
 
 from dataclasses import dataclass
+from dulwich.errors import NotGitRepository
 from dulwich.repo import Repo
 from itertools import batched, chain
 from numpy import float32
 from numpy.typing import NDArray
+from pathlib import PurePath
 from pydantic import BaseModel
 from openai import AsyncOpenAI
 from tiktoken import Encoding
@@ -69,13 +71,34 @@ max_tokens_per_embed = 8192
 
 max_tokens_per_batch_embed = 300000
 
-async def embed(facets: Facets, repository: str) -> Cluster:
-    repo = Repo(repository)
+async def embed(facets: Facets, directory: str) -> Cluster:
+    try:
+        repo = Repo.discover(directory)
+
+        def generate_paths():
+            for bytestring in repo.open_index().paths():
+                path = bytestring.decode("utf-8")
+
+                subdirectory = PurePath(directory).relative_to(repo.path)
+
+                try:
+                    relative_path = PurePath(path).relative_to(subdirectory)
+
+                    yield str(relative_path)
+                except ValueError:
+                    pass
+
+    except NotGitRepository:
+        def generate_paths():
+            for entry in os.scandir(directory):
+                if entry.is_file(follow_symlinks = False):
+                    yield entry.path
+
 
     async def read(path):
-        absolute_path = os.path.join(repository, path)
-
         try:
+            absolute_path = os.path.join(directory, path)
+
             async with aiofiles.open(absolute_path, "rb") as handle:
                 prefix = f"{path}:\n\n"
 
@@ -113,7 +136,7 @@ async def embed(facets: Facets, repository: str) -> Cluster:
             return [ ]
 
     tasks = tqdm_asyncio.gather(
-        *(read(path.decode("utf-8")) for path in repo.open_index().paths()),
+        *(read(path) for path in generate_paths()),
         desc = "Reading files",
         unit = "file",
         leave = False
