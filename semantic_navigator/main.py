@@ -85,12 +85,17 @@ def list_devices():
          "Get-CimInstance Win32_VideoController | Select-Object -Property Name"],
         capture_output = True, text = True
     )
-    print("GPU devices:")
-    for i, line in enumerate(
+    names = [
         line.strip() for line in result.stdout.strip().splitlines()
         if line.strip() and line.strip() != "Name" and not line.strip().startswith("----")
-    ):
-        print(f"  {i}: {line}")
+    ]
+    print("GPU devices:")
+    for i, name in enumerate(names):
+        vram = detect_device_memory(True, i)
+        if vram is not None:
+            print(f"  {i}: {name} ({vram / 1e9:.1f} GB)")
+        else:
+            print(f"  {i}: {name} (unknown VRAM)")
 
 def case_insensitive_glob(pattern: str) -> str:
     return ''.join(
@@ -204,6 +209,19 @@ def _resolve_gpu_layers(gpu: bool, gpu_layers: int | None, device: int, model_si
             return int(100 * vram * 0.6 / model_size)
     return -1
 
+def _estimate_model_size(local: str, local_file: str | None) -> int | None:
+    """Estimate model file size in bytes without loading. Returns None if unknown."""
+    is_local_file = os.path.exists(local) or "\\" in local or local.count("/") > 1
+    if is_local_file:
+        return os.path.getsize(local)
+    if local_file is None:
+        try:
+            _, model_size = select_best_gguf(local, None)
+            return model_size
+        except Exception:
+            return None
+    return None
+
 def _create_local_model(local: str, local_file: str | None, gpu: bool, device: int, gpu_layers: int | None, n_ctx: int, debug: bool) -> object:
     from llama_cpp import Llama
 
@@ -243,7 +261,12 @@ def initialize(cli_command: list[str] | None, local: str | None, local_file: str
 
     if local is not None:
         if gpu:
+            model_size = _estimate_model_size(local, local_file)
             for device in devices:
+                vram = detect_device_memory(True, device)
+                if model_size is not None and vram is not None and vram < model_size:
+                    print(f"Skipping GPU {device}: insufficient VRAM ({vram / 1e9:.1f} GB) for model ({model_size / 1e9:.1f} GB)")
+                    continue
                 model = _create_local_model(local, local_file, True, device, gpu_layers, n_ctx, debug)
                 aspects.append(Aspect(
                     name = f"local/gpu:{device}",
