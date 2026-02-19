@@ -8,7 +8,6 @@ dependencies = [
     "aiofiles",
     "dulwich",
     "fastembed",
-    "openai[aiohttp]",
     "pydantic",
     "scikit-learn",
     "textual",
@@ -16,7 +15,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-openai-embeddings = ["tiktoken"]
+gpu = ["onnxruntime-directml"]
+local = ["llama-cpp-python"]
+openai = ["openai", "tiktoken"]
 
 [project.scripts]
 semantic-navigator = "semantic_navigator.main:main"
