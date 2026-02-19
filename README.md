@@ -63,8 +63,8 @@ $ semantic-navigator ./path/to/repository
 ## Usage
 
 Depending on the size of the project it will probably take between a few
-seconds to a minute to produce a tree viewer.  You must specify which CLI tool
-to use via `--<tool>`:
+seconds to a minute to produce a tree viewer.  You must specify which backend
+to use:
 
 ```ShellSession
 # Gemini CLI
@@ -76,6 +76,30 @@ $ semantic-navigator ./path/to/repository --llm -m gpt-4o
 # aichat
 $ semantic-navigator --aichat ./path/to/repository
 ```
+
+### OpenAI
+
+You can use OpenAI directly via `--openai`. Install the optional dependency
+first:
+
+```ShellSession
+$ uv sync --extra openai
+```
+
+Then run with `--openai`:
+
+```ShellSession
+# Default model (gpt-4o-mini)
+$ semantic-navigator --openai ./path/to/repository
+
+# Custom completion model
+$ semantic-navigator --openai --completion-model gpt-4o ./path/to/repository
+
+# Use OpenAI for both labeling and embeddings
+$ semantic-navigator --openai --openai-embedding-model text-embedding-3-large ./path/to/repository
+```
+
+This requires the `OPENAI_API_KEY` environment variable to be set.
 
 ### Local LLM
 

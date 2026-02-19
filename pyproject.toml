@@ -17,6 +17,7 @@ dependencies = [
 [project.optional-dependencies]
 gpu = ["onnxruntime-directml"]
 local = ["llama-cpp-python"]
+openai = ["openai", "tiktoken"]
 
 [project.scripts]
 semantic-navigator = "semantic_navigator.main:main"

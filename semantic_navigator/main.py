@@ -57,11 +57,13 @@ max_clusters = 20
 
 @dataclass(frozen = True)
 class Aspect:
-    """A single inference backend (CLI tool or local model)."""
+    """A single inference backend (CLI tool, local model, or OpenAI)."""
     name: str
     cli_command: list[str] | None
     local_model: object | None
     local_n_ctx: int | None
+    openai_client: object | None
+    openai_model: str | None
 
 class AspectPool:
     """Async pool that distributes work across multiple inference backends."""
@@ -92,12 +94,14 @@ class Facets:
     repository: str
     model_identity: str
     pool: AspectPool
-    embedding_model: TextEmbedding
+    embedding_model: TextEmbedding | None
     embedding_model_name: str
     gpu: bool
     batch_size: int
     timeout: int
     debug: bool
+    openai_client: object | None
+    openai_embedding_model: str | None
 
 def list_devices():
     if sys.platform == "win32":
@@ -388,7 +392,7 @@ def _create_local_model(local: str, local_file: str | None, gpu: bool, device: i
             verbose = debug,
         )
 
-def initialize(repository: str, model_identity: str, cli_command: list[str] | None, local: str | None, local_file: str | None, embedding_model: str, gpu: bool, cpu: bool, cpu_offload: bool, devices: list[int], gpu_layers: int | None, batch_size: int | None, concurrency: int, n_ctx: int, timeout: int, debug: bool) -> Facets:
+def initialize(repository: str, model_identity: str, cli_command: list[str] | None, local: str | None, local_file: str | None, embedding_model: str, gpu: bool, cpu: bool, cpu_offload: bool, devices: list[int], gpu_layers: int | None, batch_size: int | None, concurrency: int, n_ctx: int, timeout: int, debug: bool, openai_model: str | None = None, openai_embedding_model: str | None = None) -> Facets:
     aspects: list[Aspect] = []
 
     if local is not None:
@@ -409,6 +413,8 @@ def initialize(repository: str, model_identity: str, cli_command: list[str] | No
                     cli_command = None,
                     local_model = model,
                     local_n_ctx = model.n_ctx(),
+                    openai_client = None,
+                    openai_model = None,
                 ))
             if cpu:
                 model = _create_local_model(local, local_file, False, 0, 0, n_ctx, debug)
@@ -417,6 +423,8 @@ def initialize(repository: str, model_identity: str, cli_command: list[str] | No
                     cli_command = None,
                     local_model = model,
                     local_n_ctx = model.n_ctx(),
+                    openai_client = None,
+                    openai_model = None,
                 ))
         else:
             model = _create_local_model(local, local_file, False, 0, 0, n_ctx, debug)
@@ -425,6 +433,8 @@ def initialize(repository: str, model_identity: str, cli_command: list[str] | No
                 cli_command = None,
                 local_model = model,
                 local_n_ctx = model.n_ctx(),
+                openai_client = None,
+                openai_model = None,
             ))
 
     if cli_command is not None:
@@ -435,22 +445,47 @@ def initialize(repository: str, model_identity: str, cli_command: list[str] | No
                 cli_command = cli_command,
                 local_model = None,
                 local_n_ctx = None,
+                openai_client = None,
+                openai_model = None,
+            ))
+
+    if openai_model is not None:
+        from openai import AsyncOpenAI
+        client = AsyncOpenAI()
+        print(f"OpenAI model: {openai_model} (concurrency {concurrency})")
+        for i in range(concurrency):
+            aspects.append(Aspect(
+                name = f"openai/{i}",
+                cli_command = None,
+                local_model = None,
+                local_n_ctx = None,
+                openai_client = client,
+                openai_model = openai_model,
             ))
 
     if not aspects:
         raise SystemExit("Error: no inference backends available. All GPU devices were skipped or failed to load.")
 
-    if gpu:
-        device = devices[0]
-        providers = [("DmlExecutionProvider", {"device_id": device})]
-        if cpu_offload:
-            providers.append("CPUExecutionProvider")
+    openai_client_for_embed = None
+    if openai_embedding_model is not None:
+        from openai import AsyncOpenAI
+        openai_client_for_embed = AsyncOpenAI()
+        print(f"OpenAI embedding model: {openai_embedding_model}")
+        embedding = None
+        if batch_size is None:
+            batch_size = 256
     else:
-        providers = ["CPUExecutionProvider"]
-    if batch_size is None:
-        batch_size = 32 if gpu else 256
-    print(f"Loading embedding model ({embedding_model}, batch size {batch_size})...")
-    embedding = TextEmbedding(model_name = embedding_model, providers = providers)
+        if gpu:
+            device = devices[0]
+            providers = [("DmlExecutionProvider", {"device_id": device})]
+            if cpu_offload:
+                providers.append("CPUExecutionProvider")
+        else:
+            providers = ["CPUExecutionProvider"]
+        if batch_size is None:
+            batch_size = 32 if gpu else 256
+        print(f"Loading embedding model ({embedding_model}, batch size {batch_size})...")
+        embedding = TextEmbedding(model_name = embedding_model, providers = providers)
     print(f"Initialized {len(aspects)} aspect{'s' if len(aspects) != 1 else ''}: {', '.join(a.name for a in aspects)}")
     return Facets(
         repository = repository,
@@ -462,6 +497,8 @@ def initialize(repository: str, model_identity: str, cli_command: list[str] | No
         batch_size = batch_size,
         timeout = timeout,
         debug = debug,
+        openai_client = openai_client_for_embed,
+        openai_embedding_model = openai_embedding_model,
     )
 
 def extract_json(text: str) -> str:
@@ -525,7 +562,38 @@ async def complete(facets: Facets, prompt: str, output_type: type[T], progress: 
         aspect = await facets.pool.acquire()
         release_aspect = True
         try:
-            if aspect.local_model is not None:
+            if aspect.openai_client is not None:
+                response = await aspect.openai_client.responses.parse(
+                    model = aspect.openai_model,
+                    input = prompt,
+                    text_format = output_type,
+                )
+                if response.output_parsed is not None:
+                    parsed = response.output_parsed
+                    if expected_count is not None and hasattr(parsed, 'labels') and len(parsed.labels) != expected_count:
+                        if len(parsed.labels) > expected_count:
+                            tqdm.write(f"[{aspect.name}] Truncating {len(parsed.labels)} → {expected_count} labels")
+                            parsed.labels = parsed.labels[:expected_count]
+                        elif attempt < max_count_retries - 1:
+                            tqdm.write(f"[{aspect.name}] Retry {attempt + 1}/{max_count_retries}: expected {expected_count} labels, got {len(parsed.labels)}")
+                            continue
+                        else:
+                            tqdm.write(f"Padding {len(parsed.labels)} labels to {expected_count} (gave up after {max_count_retries} attempts)")
+                            while len(parsed.labels) < expected_count:
+                                parsed.labels.append(Label(
+                                    overarchingTheme = "Miscellaneous",
+                                    distinguishingFeature = "Ungrouped",
+                                    label = "Miscellaneous",
+                                ))
+                    if progress is not None:
+                        progress.update(1)
+                    return parsed
+                else:
+                    if attempt < max_retries - 1:
+                        tqdm.write(f"[{aspect.name}] Retry {attempt + 1}/{max_retries}: OpenAI returned no parsed output")
+                        continue
+                    raise RuntimeError("OpenAI returned no parsed output")
+            elif aspect.local_model is not None:
                 response_format = None
                 if expected_count is not None:
                     response_format = {
@@ -781,26 +849,64 @@ async def embed(facets: Facets, directory: str) -> Cluster:
     if uncached_indices:
         uncached_contents = [contents[i] for i in uncached_indices]
 
-        def do_embed(model: TextEmbedding, desc: str) -> list[NDArray[float32]]:
-            return [
-                numpy.asarray(e, float32)
-                for e in tqdm(
-                    model.embed(uncached_contents, batch_size = facets.batch_size),
-                    desc = desc,
-                    unit = "file",
-                    total = len(uncached_contents),
-                    leave = False
-                )
-            ]
+        if facets.openai_client is not None:
+            # OpenAI embedding with token-aware chunking
+            import tiktoken
+            try:
+                encoding = tiktoken.encoding_for_model(facets.openai_embedding_model)
+            except KeyError:
+                encoding = tiktoken.get_encoding("cl100k_base")
 
-        try:
-            new_embeddings = do_embed(facets.embedding_model, f"Embedding contents ({len(uncached_indices)} uncached)")
-        except Exception as e:
-            if not facets.gpu:
-                raise
-            print(f"\nGPU embedding failed ({e}), falling back to CPU...")
-            cpu_model = TextEmbedding(model_name = facets.embedding_model_name, providers = ["CPUExecutionProvider"])
-            new_embeddings = do_embed(cpu_model, "Embedding contents (CPU)")
+            max_tokens_per_embed = 8192
+            max_embeds_per_batch = 2048
+
+            # Truncate content to fit token limit
+            truncated_contents = []
+            for content in uncached_contents:
+                tokens = encoding.encode(content)
+                if len(tokens) > max_tokens_per_embed:
+                    tokens = tokens[:max_tokens_per_embed]
+                    truncated_contents.append(encoding.decode(tokens))
+                else:
+                    truncated_contents.append(content)
+
+            async def openai_embed_batch(batch: list[str]) -> list[NDArray[float32]]:
+                response = await facets.openai_client.embeddings.create(
+                    model = facets.openai_embedding_model,
+                    input = batch,
+                )
+                return [numpy.asarray(datum.embedding, float32) for datum in response.data]
+
+            from itertools import batched
+            batches = list(batched(truncated_contents, max_embeds_per_batch))
+            new_embeddings_nested = await tqdm_asyncio.gather(
+                *(openai_embed_batch(list(batch)) for batch in batches),
+                desc = f"Embedding contents ({len(uncached_indices)} uncached)",
+                unit = "batch",
+                leave = False,
+            )
+            new_embeddings = [e for batch_result in new_embeddings_nested for e in batch_result]
+        else:
+            def do_embed(model: TextEmbedding, desc: str) -> list[NDArray[float32]]:
+                return [
+                    numpy.asarray(e, float32)
+                    for e in tqdm(
+                        model.embed(uncached_contents, batch_size = facets.batch_size),
+                        desc = desc,
+                        unit = "file",
+                        total = len(uncached_contents),
+                        leave = False
+                    )
+                ]
+
+            try:
+                new_embeddings = do_embed(facets.embedding_model, f"Embedding contents ({len(uncached_indices)} uncached)")
+            except Exception as e:
+                if not facets.gpu:
+                    raise
+                print(f"\nGPU embedding failed ({e}), falling back to CPU...")
+                cpu_model = TextEmbedding(model_name = facets.embedding_model_name, providers = ["CPUExecutionProvider"])
+                new_embeddings = do_embed(cpu_model, "Embedding contents (CPU)")
 
         for i, embedding in zip(uncached_indices, new_embeddings):
             embeddings[i] = embedding
@@ -1297,6 +1403,9 @@ def main():
     parser.add_argument("--flush-cache", action = "store_true", help = "Delete cached embeddings and labels for the given repository")
     parser.add_argument("--flush-labels", action = "store_true", help = "Delete cached labels only (keeps embeddings)")
     parser.add_argument("--erase-models", action = "store_true", help = "Delete downloaded HuggingFace models")
+    parser.add_argument("--openai", action = "store_true", help = "Use OpenAI API for labeling (requires OPENAI_API_KEY)")
+    parser.add_argument("--completion-model", default = "gpt-4o-mini", help = "OpenAI model for labeling (default: gpt-4o-mini)")
+    parser.add_argument("--openai-embedding-model", default = None, help = "Use OpenAI API for embeddings (e.g. text-embedding-3-large)")
     parser.add_argument("--local", default = None)
     parser.add_argument("--local-file", default = None)
     parser.add_argument("--n-ctx", type = int, default = None)
@@ -1366,8 +1475,8 @@ def main():
     # Extract CLI tool from unknown flags: --gemini → ["gemini"], --llm -m gpt-4o → ["llm", "-m", "gpt-4o"]
     has_cli_tool = remaining and remaining[0].startswith("--")
 
-    if arguments.local is None and not has_cli_tool:
-        parser.error("no CLI tool specified (e.g. --gemini, --llm) and no --local model provided")
+    if arguments.local is None and not has_cli_tool and not arguments.openai:
+        parser.error("no backend specified (e.g. --openai, --gemini, --llm, or --local)")
 
     if arguments.cpu_offload and not arguments.gpu:
         parser.error("--cpu-offload requires --gpu")
@@ -1384,7 +1493,7 @@ def main():
     if arguments.n_ctx is not None and arguments.local is None:
         parser.error("--n-ctx requires --local")
 
-    if arguments.concurrency is not None and arguments.local is not None and not has_cli_tool:
+    if arguments.concurrency is not None and arguments.local is not None and not has_cli_tool and not arguments.openai:
         parser.error("--concurrency has no effect with --local only (local model concurrency is 1 per device)")
 
     cli_command = None
@@ -1411,9 +1520,18 @@ def main():
             identity_parts.append(f"file:{arguments.local_file}")
     if cli_command:
         identity_parts.append(f"cli:{shlex.join(cli_command)}")
+    if arguments.openai:
+        identity_parts.append(f"openai:{arguments.completion_model}")
     model_identity = "+".join(identity_parts)
 
-    facets = initialize(arguments.repository, model_identity, cli_command, arguments.local, arguments.local_file, arguments.embedding_model, arguments.gpu, arguments.cpu, arguments.cpu_offload, devices, arguments.gpu_layers, arguments.batch_size, arguments.concurrency, arguments.n_ctx, arguments.timeout, arguments.debug)
+    openai_model = arguments.completion_model if arguments.openai else None
+
+    # When using --openai with --openai-embedding-model, override the embedding model name for cache identity
+    embedding_model_name = arguments.embedding_model
+    if arguments.openai_embedding_model:
+        embedding_model_name = arguments.openai_embedding_model
+
+    facets = initialize(arguments.repository, model_identity, cli_command, arguments.local, arguments.local_file, embedding_model_name, arguments.gpu, arguments.cpu, arguments.cpu_offload, devices, arguments.gpu_layers, arguments.batch_size, arguments.concurrency, arguments.n_ctx, arguments.timeout, arguments.debug, openai_model=openai_model, openai_embedding_model=arguments.openai_embedding_model)
 
     async def async_tasks():
         timings: dict[str, float] = {}
