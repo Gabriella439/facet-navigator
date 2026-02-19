@@ -1,0 +1,21 @@
+Improvement areas for semantic-navigator
+=========================================
+
+FIXED in comprehensive remediation commit:
+- [x] prog = "facets" → "semantic-navigator"
+- [x] Unused import: from itertools import chain
+- [x] max_chars can go negative with small n_ctx — now clamped to 1000
+- [x] _estimate_model_size used wrong budget — now uses actual device memory + kv reserve
+- [x] Empty aspect pool hangs forever — now raises SystemExit
+- [x] Model loading crash on GPU not caught — now try/except with skip
+- [x] Label cache not keyed by model — now uses model_identity hash
+- [x] Added --flush-labels for label-only cache flush
+- [x] Batch dispatch now concurrent via asyncio.gather
+- [x] HF API query now shows feedback message
+
+REMAINING (not yet addressed):
+- complete() releases broken aspects back to pool
+- count_llm_calls reads label cache from disk per-file (could use manifest)
+- Embedding cache does per-file path.exists()
+- list_devices() / detect_device_memory() GPU detection is Windows-only for GPU
+- Tree UI has no search/filter for large repos

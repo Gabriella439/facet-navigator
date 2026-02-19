@@ -23,7 +23,6 @@ from dataclasses import dataclass
 from dulwich.errors import NotGitRepository
 from dulwich.repo import Repo
 from fastembed import TextEmbedding
-from itertools import chain
 from numpy import float32
 from numpy.typing import NDArray
 from pathlib import Path, PurePath
@@ -72,6 +71,7 @@ class AspectPool:
 @dataclass(frozen = True)
 class Facets:
     repository: str
+    model_identity: str
     pool: AspectPool
     embedding_model: TextEmbedding
     embedding_model_name: str
@@ -247,14 +247,16 @@ def _resolve_gpu_layers(gpu: bool, gpu_layers: int | None, device: int, model_si
             return int(100 * vram * 0.6 / model_size)
     return -1
 
-def _estimate_model_size(local: str, local_file: str | None) -> int | None:
+def _estimate_model_size(local: str, local_file: str | None, gpu: bool, device: int, n_ctx: int) -> int | None:
     """Estimate model file size in bytes without loading. Returns None if unknown."""
     is_local_file = os.path.exists(local) or "\\" in local or local.count("/") > 1
     if is_local_file:
         return os.path.getsize(local)
     if local_file is None:
         try:
-            _, model_size = select_best_gguf(local, None)
+            memory_budget = detect_device_memory(gpu, device)
+            kv_cache_reserve = n_ctx * 128 * 2 + int(1e9)
+            _, model_size = select_best_gguf(local, memory_budget, kv_cache_reserve)
             return model_size
         except Exception:
             return None
@@ -281,6 +283,7 @@ def _create_local_model(local: str, local_file: str | None, gpu: bool, device: i
             # Reserve ~2 bytes per token per layer for KV cache, plus 1GB for runtime overhead.
             # Conservative estimate: 128 layers (covers up to ~70B models).
             kv_cache_reserve = n_ctx * 128 * 2 + int(1e9)
+            print(f"Querying HuggingFace for available quantizations...", flush=True)
             local_files, model_size = select_best_gguf(local, memory_budget, kv_cache_reserve)
             n_gpu_layers = _resolve_gpu_layers(gpu, gpu_layers, device, model_size)
             print(f"Local model: {local} (auto-selected: {local_files[0]}, {model_size / 1e9:.1f} GB, {'GPU ' + str(device) if gpu else 'CPU'})")
@@ -297,18 +300,22 @@ def _create_local_model(local: str, local_file: str | None, gpu: bool, device: i
             verbose = debug,
         )
 
-def initialize(repository: str, cli_command: list[str] | None, local: str | None, local_file: str | None, embedding_model: str, gpu: bool, cpu: bool, cpu_offload: bool, devices: list[int], gpu_layers: int | None, batch_size: int | None, concurrency: int, n_ctx: int, timeout: int, debug: bool) -> Facets:
+def initialize(repository: str, model_identity: str, cli_command: list[str] | None, local: str | None, local_file: str | None, embedding_model: str, gpu: bool, cpu: bool, cpu_offload: bool, devices: list[int], gpu_layers: int | None, batch_size: int | None, concurrency: int, n_ctx: int, timeout: int, debug: bool) -> Facets:
     aspects: list[Aspect] = []
 
     if local is not None:
         if gpu:
-            model_size = _estimate_model_size(local, local_file)
+            model_size = _estimate_model_size(local, local_file, True, devices[0], n_ctx)
             for device in devices:
                 vram = detect_device_memory(True, device)
                 if model_size is not None and vram is not None and vram < model_size:
                     print(f"Skipping GPU {device}: insufficient VRAM ({vram / 1e9:.1f} GB) for model ({model_size / 1e9:.1f} GB)")
                     continue
-                model = _create_local_model(local, local_file, True, device, gpu_layers, n_ctx, debug)
+                try:
+                    model = _create_local_model(local, local_file, True, device, gpu_layers, n_ctx, debug)
+                except (ValueError, RuntimeError) as e:
+                    print(f"Skipping GPU {device}: failed to load model ({e})")
+                    continue
                 aspects.append(Aspect(
                     name = f"local/gpu:{device}",
                     cli_command = None,
@@ -342,6 +349,9 @@ def initialize(repository: str, cli_command: list[str] | None, local: str | None
                 local_n_ctx = None,
             ))
 
+    if not aspects:
+        raise SystemExit("Error: no inference backends available. All GPU devices were skipped or failed to load.")
+
     if gpu:
         device = devices[0]
         providers = [("DmlExecutionProvider", {"device_id": device})]
@@ -356,6 +366,7 @@ def initialize(repository: str, cli_command: list[str] | None, local: str | None
     print(f"Initialized {len(aspects)} aspect{'s' if len(aspects) != 1 else ''}: {', '.join(a.name for a in aspects)}")
     return Facets(
         repository = repository,
+        model_identity = model_identity,
         pool = AspectPool(aspects),
         embedding_model = embedding,
         embedding_model_name = embedding_model,
@@ -534,8 +545,9 @@ def save_cached_embedding(directory: Path, key: str, embedding: NDArray[float32]
     directory.mkdir(parents = True, exist_ok = True)
     numpy.save(directory / f"{key}.npy", embedding)
 
-def label_cache_dir(repository: str) -> Path:
-    return repo_cache_dir(repository) / "labels"
+def label_cache_dir(repository: str, model_identity: str) -> Path:
+    safe_id = hashlib.sha256(model_identity.encode()).hexdigest()[:16]
+    return repo_cache_dir(repository) / "labels" / safe_id
 
 def load_cached_label(directory: Path, key: str) -> Label | None:
     path = directory / f"{key}.json"
@@ -896,11 +908,11 @@ def to_pattern(files: list[str]) -> str:
 def to_files(trees: list[Tree]) -> list[str]:
     return [ file for tree in trees for file in tree.files ]
 
-def count_llm_calls(ct: ClusterTree, repository: str) -> tuple[int, int]:
+def count_llm_calls(ct: ClusterTree, repository: str, model_identity: str) -> tuple[int, int]:
     """Count how many LLM calls will be needed.
     Returns (total_calls, cached_file_labels)."""
     if not ct.children:
-        ldir = label_cache_dir(repository)
+        ldir = label_cache_dir(repository, model_identity)
         uncached = sum(
             1 for embed in ct.node.embeds
             if load_cached_label(ldir, content_hash(embed.content)) is None
@@ -911,14 +923,14 @@ def count_llm_calls(ct: ClusterTree, repository: str) -> tuple[int, int]:
         total = 0
         total_cached = 0
         for child in ct.children:
-            calls, cached = count_llm_calls(child, repository)
+            calls, cached = count_llm_calls(child, repository, model_identity)
             total += calls
             total_cached += cached
         return (total + 1, total_cached)  # +1 for cluster summarization
 
 async def label_nodes(facets: Facets, ct: ClusterTree, progress: tqdm) -> list[Tree]:
     if not ct.children:
-        ldir = label_cache_dir(facets.repository)
+        ldir = label_cache_dir(facets.repository, facets.model_identity)
         cached_labels: dict[int, Label] = {}
         uncached_embeds: list[tuple[int, Embed]] = []
 
@@ -934,7 +946,7 @@ async def label_nodes(facets: Facets, ct: ClusterTree, progress: tqdm) -> list[T
             if facets.pool.min_local_n_ctx is not None:
                 # ~1.5 chars per token for code, reserve 4096 tokens for response,
                 # 1000 chars for prompt instructions/schema overhead
-                max_chars = int((facets.pool.min_local_n_ctx - 4096) * 1.5) - 1000
+                max_chars = max(int((facets.pool.min_local_n_ctx - 4096) * 1.5) - 1000, 1000)
 
                 def render_embed(embed: Embed) -> str:
                     content = embed.content
@@ -964,7 +976,7 @@ async def label_nodes(facets: Facets, ct: ClusterTree, progress: tqdm) -> list[T
 
             schema = json.dumps(Labels.model_json_schema(), indent=2)
 
-            for batch in batches:
+            async def process_batch(batch: list[tuple[int, Embed]]) -> None:
                 rendered_embeds = "\n\n".join([ render_embed(embed) for _, embed in batch ])
 
                 prompt = (
@@ -979,6 +991,8 @@ async def label_nodes(facets: Facets, ct: ClusterTree, progress: tqdm) -> list[T
                 for (i, embed), label in zip(batch, result.labels):
                     cached_labels[i] = label
                     save_cached_label(ldir, content_hash(embed.content), label)
+
+            await asyncio.gather(*(process_batch(batch) for batch in batches))
 
         return [
             Tree(
@@ -1018,7 +1032,7 @@ async def label_nodes(facets: Facets, ct: ClusterTree, progress: tqdm) -> list[T
 
 async def tree(facets: Facets, label: str, c: Cluster) -> Tree:
     ct = build_cluster_tree(c)
-    total_calls, cached_labels = count_llm_calls(ct, facets.repository)
+    total_calls, cached_labels = count_llm_calls(ct, facets.repository, facets.model_identity)
     if cached_labels > 0:
         print(f"Loaded {cached_labels} file labels from cache", flush=True)
     if total_calls > 0:
@@ -1053,7 +1067,7 @@ class UI(textual.app.App):
 
 def main():
     parser = argparse.ArgumentParser(
-        prog = "facets",
+        prog = "semantic-navigator",
         description = "Cluster documents by semantic facets",
     )
 
@@ -1069,6 +1083,7 @@ def main():
     parser.add_argument("--timeout", type = int, default = 60)
     parser.add_argument("--list-devices", action = "store_true")
     parser.add_argument("--flush-cache", action = "store_true", help = "Delete cached embeddings and labels for the given repository")
+    parser.add_argument("--flush-labels", action = "store_true", help = "Delete cached labels only (keeps embeddings)")
     parser.add_argument("--erase-models", action = "store_true", help = "Delete downloaded HuggingFace models")
     parser.add_argument("--local", default = None)
     parser.add_argument("--local-file", default = None)
@@ -1125,6 +1140,17 @@ def main():
             print(f"No cache found.")
         return
 
+    if arguments.flush_labels:
+        repo_dir = repo_cache_dir(arguments.repository)
+        labels_dir = repo_dir / "labels"
+        if labels_dir.exists():
+            size = sum(f.stat().st_size for f in labels_dir.rglob("*") if f.is_file())
+            shutil.rmtree(labels_dir)
+            print(f"Flushed label cache for {arguments.repository} ({size / 1e6:.1f} MB)")
+        else:
+            print(f"No label cache found for {arguments.repository}")
+        return
+
     # Extract CLI tool from unknown flags: --gemini → ["gemini"], --llm -m gpt-4o → ["llm", "-m", "gpt-4o"]
     has_cli_tool = remaining and remaining[0].startswith("--")
 
@@ -1166,7 +1192,16 @@ def main():
     if arguments.concurrency is None:
         arguments.concurrency = 4
 
-    facets = initialize(arguments.repository, cli_command, arguments.local, arguments.local_file, arguments.embedding_model, arguments.gpu, arguments.cpu, arguments.cpu_offload, devices, arguments.gpu_layers, arguments.batch_size, arguments.concurrency, arguments.n_ctx, arguments.timeout, arguments.debug)
+    identity_parts = []
+    if arguments.local:
+        identity_parts.append(f"local:{arguments.local}")
+        if arguments.local_file:
+            identity_parts.append(f"file:{arguments.local_file}")
+    if cli_command:
+        identity_parts.append(f"cli:{shlex.join(cli_command)}")
+    model_identity = "+".join(identity_parts)
+
+    facets = initialize(arguments.repository, model_identity, cli_command, arguments.local, arguments.local_file, arguments.embedding_model, arguments.gpu, arguments.cpu, arguments.cpu_offload, devices, arguments.gpu_layers, arguments.batch_size, arguments.concurrency, arguments.n_ctx, arguments.timeout, arguments.debug)
 
     async def async_tasks():
         initial_cluster = await embed(facets, arguments.repository)
