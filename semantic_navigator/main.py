@@ -71,6 +71,7 @@ class AspectPool:
 
 @dataclass(frozen = True)
 class Facets:
+    repository: str
     pool: AspectPool
     embedding_model: TextEmbedding
     embedding_model_name: str
@@ -256,7 +257,7 @@ def _create_local_model(local: str, local_file: str | None, gpu: bool, device: i
             verbose = debug,
         )
 
-def initialize(cli_command: list[str] | None, local: str | None, local_file: str | None, embedding_model: str, gpu: bool, cpu: bool, cpu_offload: bool, devices: list[int], gpu_layers: int | None, batch_size: int | None, concurrency: int, n_ctx: int, timeout: int, debug: bool) -> Facets:
+def initialize(repository: str, cli_command: list[str] | None, local: str | None, local_file: str | None, embedding_model: str, gpu: bool, cpu: bool, cpu_offload: bool, devices: list[int], gpu_layers: int | None, batch_size: int | None, concurrency: int, n_ctx: int, timeout: int, debug: bool) -> Facets:
     aspects: list[Aspect] = []
 
     if local is not None:
@@ -314,6 +315,7 @@ def initialize(cli_command: list[str] | None, local: str | None, local_file: str
     embedding = TextEmbedding(model_name = embedding_model, providers = providers)
     print(f"Initialized {len(aspects)} aspect{'s' if len(aspects) != 1 else ''}: {', '.join(a.name for a in aspects)}")
     return Facets(
+        repository = repository,
         pool = AspectPool(aspects),
         embedding_model = embedding,
         embedding_model_name = embedding_model,
@@ -468,11 +470,19 @@ def app_cache_dir() -> Path:
         base = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
     return base / "semantic-navigator"
 
+def _sanitize_path(path: str) -> str:
+    """Turn an absolute path into a safe directory name."""
+    resolved = os.path.realpath(path)
+    return resolved.replace("\\", "--").replace("/", "--").replace(":", "")
+
+def repo_cache_dir(repository: str) -> Path:
+    return app_cache_dir() / "repos" / _sanitize_path(repository)
+
 def content_hash(content: str) -> str:
     return hashlib.sha256(content.encode()).hexdigest()
 
-def embedding_cache_dir(model_name: str) -> Path:
-    return app_cache_dir() / "embeddings" / model_name.replace("/", "--")
+def embedding_cache_dir(repository: str, model_name: str) -> Path:
+    return repo_cache_dir(repository) / "embeddings" / model_name.replace("/", "--")
 
 def load_cached_embedding(directory: Path, key: str) -> NDArray[float32] | None:
     path = directory / f"{key}.npy"
@@ -484,8 +494,8 @@ def save_cached_embedding(directory: Path, key: str, embedding: NDArray[float32]
     directory.mkdir(parents = True, exist_ok = True)
     numpy.save(directory / f"{key}.npy", embedding)
 
-def label_cache_dir() -> Path:
-    return app_cache_dir() / "labels"
+def label_cache_dir(repository: str) -> Path:
+    return repo_cache_dir(repository) / "labels"
 
 def load_cached_label(directory: Path, key: str) -> Label | None:
     path = directory / f"{key}.json"
@@ -570,7 +580,7 @@ async def embed(facets: Facets, directory: str) -> Cluster:
 
     paths, contents = zip(*results)
 
-    cdir = embedding_cache_dir(facets.embedding_model_name)
+    cdir = embedding_cache_dir(facets.repository, facets.embedding_model_name)
     embeddings: list[NDArray[float32]] = [None] * len(contents)  # type: ignore[list-item]
     uncached_indices = []
 
@@ -846,11 +856,11 @@ def to_pattern(files: list[str]) -> str:
 def to_files(trees: list[Tree]) -> list[str]:
     return [ file for tree in trees for file in tree.files ]
 
-def count_llm_calls(ct: ClusterTree) -> tuple[int, int]:
+def count_llm_calls(ct: ClusterTree, repository: str) -> tuple[int, int]:
     """Count how many LLM calls will be needed.
     Returns (total_calls, cached_file_labels)."""
     if not ct.children:
-        ldir = label_cache_dir()
+        ldir = label_cache_dir(repository)
         uncached = sum(
             1 for embed in ct.node.embeds
             if load_cached_label(ldir, content_hash(embed.content)) is None
@@ -861,14 +871,14 @@ def count_llm_calls(ct: ClusterTree) -> tuple[int, int]:
         total = 0
         total_cached = 0
         for child in ct.children:
-            calls, cached = count_llm_calls(child)
+            calls, cached = count_llm_calls(child, repository)
             total += calls
             total_cached += cached
         return (total + 1, total_cached)  # +1 for cluster summarization
 
 async def label_nodes(facets: Facets, ct: ClusterTree, progress: tqdm) -> list[Tree]:
     if not ct.children:
-        ldir = label_cache_dir()
+        ldir = label_cache_dir(facets.repository)
         cached_labels: dict[int, Label] = {}
         uncached_embeds: list[tuple[int, Embed]] = []
 
@@ -968,7 +978,7 @@ async def label_nodes(facets: Facets, ct: ClusterTree, progress: tqdm) -> list[T
 
 async def tree(facets: Facets, label: str, c: Cluster) -> Tree:
     ct = build_cluster_tree(c)
-    total_calls, cached_labels = count_llm_calls(ct)
+    total_calls, cached_labels = count_llm_calls(ct, facets.repository)
     if cached_labels > 0:
         print(f"Loaded {cached_labels} file labels from cache", flush=True)
     if total_calls > 0:
@@ -1018,6 +1028,8 @@ def main():
     parser.add_argument("--concurrency", type = int, default = None)
     parser.add_argument("--timeout", type = int, default = 60)
     parser.add_argument("--list-devices", action = "store_true")
+    parser.add_argument("--flush-cache", action = "store_true", help = "Delete cached embeddings and labels for the given repository")
+    parser.add_argument("--erase-models", action = "store_true", help = "Delete downloaded HuggingFace models")
     parser.add_argument("--local", default = None)
     parser.add_argument("--local-file", default = None)
     parser.add_argument("--n-ctx", type = int, default = None)
@@ -1028,8 +1040,42 @@ def main():
         list_devices()
         return
 
+    if arguments.erase_models:
+        try:
+            from huggingface_hub import scan_cache_dir
+            cache_info = scan_cache_dir()
+            if not cache_info.repos:
+                print("No downloaded models found.")
+                return
+            total_size = sum(r.size_on_disk for r in cache_info.repos)
+            print(f"Downloaded models ({total_size / 1e9:.1f} GB):")
+            for repo in sorted(cache_info.repos, key=lambda r: r.size_on_disk, reverse=True):
+                print(f"  {repo.repo_id} ({repo.size_on_disk / 1e9:.1f} GB)")
+            confirm = input("\nDelete all downloaded models? [y/N] ").strip().lower()
+            if confirm == "y":
+                delete_strategy = cache_info.delete_revisions(
+                    r.commit_hash for repo in cache_info.repos for r in repo.revisions
+                )
+                delete_strategy.execute()
+                print("Done.")
+            else:
+                print("Aborted.")
+        except ImportError:
+            print("huggingface_hub is not installed.")
+        return
+
     if arguments.repository is None:
         parser.error("the following arguments are required: repository")
+
+    if arguments.flush_cache:
+        cache_dir = repo_cache_dir(arguments.repository)
+        if cache_dir.exists():
+            size = sum(f.stat().st_size for f in cache_dir.rglob("*") if f.is_file())
+            shutil.rmtree(cache_dir)
+            print(f"Flushed cache for {arguments.repository} ({size / 1e6:.1f} MB)")
+        else:
+            print(f"No cache found for {arguments.repository}")
+        return
 
     # Extract CLI tool from unknown flags: --gemini → ["gemini"], --llm -m gpt-4o → ["llm", "-m", "gpt-4o"]
     has_cli_tool = remaining and remaining[0].startswith("--")
@@ -1072,7 +1118,7 @@ def main():
     if arguments.concurrency is None:
         arguments.concurrency = 4
 
-    facets = initialize(cli_command, arguments.local, arguments.local_file, arguments.embedding_model, arguments.gpu, arguments.cpu, arguments.cpu_offload, devices, arguments.gpu_layers, arguments.batch_size, arguments.concurrency, arguments.n_ctx, arguments.timeout, arguments.debug)
+    facets = initialize(arguments.repository, cli_command, arguments.local, arguments.local_file, arguments.embedding_model, arguments.gpu, arguments.cpu, arguments.cpu_offload, devices, arguments.gpu_layers, arguments.batch_size, arguments.concurrency, arguments.n_ctx, arguments.timeout, arguments.debug)
 
     async def async_tasks():
         initial_cluster = await embed(facets, arguments.repository)
