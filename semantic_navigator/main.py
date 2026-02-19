@@ -350,6 +350,7 @@ def _local_complete(model: object, prompt: str) -> str:
     return result["choices"][0]["message"]["content"]
 
 max_retries = 60
+max_count_retries = 5
 
 async def complete(facets: Facets, prompt: str, output_type: type[T], progress: tqdm | None = None, expected_count: int | None = None) -> T:
     """Run CLI tool or local model with prompt, parse JSON response into Pydantic model."""
@@ -404,14 +405,20 @@ async def complete(facets: Facets, prompt: str, output_type: type[T], progress: 
                 raise
         if expected_count is not None and hasattr(result, 'labels') and len(result.labels) != expected_count:
             if len(result.labels) > expected_count:
-                # Too many labels — truncate to expected count
                 tqdm.write(f"Truncating {len(result.labels)} labels to {expected_count}")
                 result.labels = result.labels[:expected_count]
-            elif attempt < max_retries - 1:
-                tqdm.write(f"Retrying ({attempt + 1}/{max_retries}): expected {expected_count} labels, got {len(result.labels)}")
+            elif attempt < max_count_retries - 1:
+                tqdm.write(f"Retrying ({attempt + 1}/{max_count_retries}): expected {expected_count} labels, got {len(result.labels)}")
                 continue
             else:
-                tqdm.write(f"Warning: expected {expected_count} labels, got {len(result.labels)} after {max_retries} attempts")
+                # Pad with generic labels rather than retrying forever
+                tqdm.write(f"Padding {len(result.labels)} labels to {expected_count} (gave up after {max_count_retries} attempts)")
+                while len(result.labels) < expected_count:
+                    result.labels.append(Label(
+                        overarchingTheme = "Miscellaneous",
+                        distinguishingFeature = "Ungrouped",
+                        label = "Miscellaneous",
+                    ))
         if progress is not None:
             progress.update(1)
         return result
