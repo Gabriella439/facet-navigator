@@ -10,35 +10,19 @@ import numpy
 import pytest
 from numpy import float32
 
-from semantic_navigator.main import (
-    Aspect,
-    AspectPool,
-    Cluster,
-    ClusterTree,
-    Embed,
-    Facets,
-    Label,
-    Labels,
-    Tree,
-    _read_file,
-    _generate_paths,
-    build_cluster_tree,
-    cluster,
-    cluster_hash,
-    content_hash,
-    count_cached_labels,
-    label_nodes,
-    list_cached_keys,
-    load_cached_cluster_labels,
-    load_cached_embedding,
-    load_cached_label,
-    save_cached_cluster_labels,
-    save_cached_embedding,
-    save_cached_label,
-    timed,
-    to_files,
-    to_pattern,
+from semantic_navigator.cache import (
+    cluster_hash, content_hash, list_cached_keys,
+    load_cached_cluster_labels, load_cached_embedding, load_cached_label,
+    save_cached_cluster_labels, save_cached_embedding, save_cached_label,
 )
+from semantic_navigator.models import (
+    Aspect, AspectPool, Cluster, ClusterTree, Embed, Facets, Label, Labels, Tree,
+)
+from semantic_navigator.pipeline import (
+    _generate_paths, _read_file, build_cluster_tree, cluster,
+    count_cached_labels, label_nodes, to_files, to_pattern,
+)
+from semantic_navigator.util import timed
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +197,7 @@ class TestClusterIntegration:
         _, c = self._make_cluster(60)
         ct = build_cluster_tree(c)
         assert ct.children  # should have children
-        from semantic_navigator.main import _count_tree_leaves, _count_tree_depth
+        from semantic_navigator.pipeline import _count_tree_leaves, _count_tree_depth
         assert _count_tree_leaves(ct) >= 2
         assert _count_tree_depth(ct) >= 1
 
@@ -388,7 +372,7 @@ class TestPipelineIntegration:
         ct = build_cluster_tree(c)
 
         # Verify tree invariants
-        from semantic_navigator.main import _count_tree_leaves, _count_tree_depth
+        from semantic_navigator.pipeline import _count_tree_leaves, _count_tree_depth
         leaves = _count_tree_leaves(ct)
         assert leaves >= 2
         depth = _count_tree_depth(ct)

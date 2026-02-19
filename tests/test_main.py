@@ -7,32 +7,19 @@ import numpy
 import pytest
 from numpy import float32
 
-from semantic_navigator.main import (
-    ClusterTree,
-    Cluster,
-    Embed,
-    Label,
-    Labels,
-    Tree,
-    _show_status,
-    _build_labels_schema,
-    _build_model_identity,
-    _count_tree_depth,
-    _count_tree_leaves,
-    _fmt_time,
-    _parse_cli_tool,
-    _parse_raw_response,
-    _resolve_gpu_layers,
-    _sanitize_path,
-    _validate_label_count,
-    case_insensitive_glob,
-    cluster_hash,
-    content_hash,
-    count_cached_labels,
-    extract_json,
-    repair_json,
-    to_files,
-    to_pattern,
+from semantic_navigator.cache import cluster_hash, content_hash
+from semantic_navigator.gpu import _resolve_gpu_layers
+from semantic_navigator.inference import (
+    _build_labels_schema, _parse_raw_response, _validate_label_count,
+    max_count_retries,
+)
+from semantic_navigator.main import _build_model_identity, _parse_cli_tool, _show_status
+from semantic_navigator.models import Cluster, ClusterTree, Embed, Label, Labels, Tree
+from semantic_navigator.pipeline import (
+    _count_tree_depth, _count_tree_leaves, count_cached_labels, to_files, to_pattern,
+)
+from semantic_navigator.util import (
+    _sanitize_path, case_insensitive_glob, extract_json, _fmt_time, repair_json,
 )
 
 
@@ -213,7 +200,6 @@ class TestValidateLabelCount:
         assert result is None
 
     def test_padding_at_max_attempts(self):
-        from semantic_navigator.main import max_count_retries
         parsed = Labels(labels=[_label()])
         result = _validate_label_count(parsed, 3, "test", max_count_retries - 1)
         assert result is not None

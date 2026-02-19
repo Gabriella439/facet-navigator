@@ -9,7 +9,7 @@ def list_devices():
         result = subprocess.run(
             ["powershell", "-Command",
              "Get-CimInstance Win32_VideoController | Select-Object -Property Name"],
-            capture_output = True, text = True
+            capture_output = True, text = True, timeout = 15,
         )
         names = [
             line.strip() for line in result.stdout.strip().splitlines()
@@ -242,5 +242,7 @@ def _resolve_gpu_layers(gpu: bool, gpu_layers: int | None, device: int, model_si
     if model_size:
         vram = detect_device_memory(True, device)
         if vram:
-            return int(100 * vram * 0.6 / model_size)
+            ratio = vram * 0.6 / model_size
+            # -1 means all layers in llama.cpp; use it when VRAM comfortably fits the model
+            return -1 if ratio >= 1.0 else int(100 * ratio)
     return -1

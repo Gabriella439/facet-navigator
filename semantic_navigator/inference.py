@@ -157,11 +157,10 @@ async def complete(facets: Facets, prompt: str, output_type: type[T], progress: 
                 except (OSError, RuntimeError) as e:
                     # Local model crash — permanently remove this aspect
                     release_aspect = False
-                    remaining = [a for a in facets.pool.aspects if a is not aspect]
+                    remaining = facets.pool.remove(aspect)
                     if not remaining:
                         raise SystemExit(f"All inference backends have failed. Last error: {e}")
-                    facets.pool.aspects = remaining
-                    tqdm.write(f"Aspect {aspect.name} failed permanently ({e}), removed from pool ({len(remaining)} remaining)")
+                    tqdm.write(f"Aspect {aspect.name} failed permanently ({e}), removed from pool ({remaining} remaining)")
                     if attempt < max_retries - 1:
                         continue
                     raise

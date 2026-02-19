@@ -232,11 +232,15 @@ def cluster(input: Cluster) -> list[Cluster]:
         for n_neighbors in candidate_neighbor_counts
     ]
 
-    n_neighbors, nearest_neighbors = [
+    connected = [
         (n_neighbors, nearest_neighbors)
         for n_components, n_neighbors, nearest_neighbors in results
         if n_components == 1
-    ][0]
+    ]
+    if not connected:
+        # No neighbor count produced a connected graph; fall back to treating as a single cluster
+        return [input]
+    n_neighbors, nearest_neighbors = connected[0]
 
     distances, indices = nearest_neighbors.kneighbors()
 

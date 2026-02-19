@@ -72,6 +72,24 @@ class AspectPool:
     def release(self, aspect: Aspect) -> None:
         self._ensure_queue().put_nowait(aspect)
 
+    def remove(self, aspect: Aspect) -> int:
+        """Permanently remove an aspect from the pool. Returns remaining count.
+        Drains and rebuilds the queue to ensure the dead aspect is not re-acquired."""
+        self.aspects = [a for a in self.aspects if a is not aspect]
+        if self._queue is not None:
+            # Drain queue, filter out the removed aspect, re-enqueue the rest
+            remaining: list[Aspect] = []
+            while not self._queue.empty():
+                try:
+                    a = self._queue.get_nowait()
+                    if a is not aspect:
+                        remaining.append(a)
+                except asyncio.QueueEmpty:
+                    break
+            for a in remaining:
+                self._queue.put_nowait(a)
+        return len(self.aspects)
+
     @property
     def min_local_n_ctx(self) -> int | None:
         ctxs = [a.local_n_ctx for a in self.aspects if a.local_n_ctx is not None]

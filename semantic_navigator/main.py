@@ -8,36 +8,12 @@ import textual
 import textual.app
 import textual.widgets
 
-# Re-export all public names for backwards compatibility
-from semantic_navigator.models import (  # noqa: F401
-    Aspect, AspectPool, Cluster, ClusterTree, Embed, Facets, Label, Labels, Tree,
-)
-from semantic_navigator.util import (  # noqa: F401
-    _fmt_time, _sanitize_path, case_insensitive_glob, extract_json, repair_json, timed,
-)
-from semantic_navigator.cache import (  # noqa: F401
-    app_cache_dir, cluster_hash, content_hash, embedding_cache_dir, label_cache_dir,
-    list_cached_keys, load_cached_cluster_labels, load_cached_embedding, load_cached_label,
-    repo_cache_dir, save_cached_cluster_labels, save_cached_embedding, save_cached_label,
-)
-from semantic_navigator.gpu import (  # noqa: F401
-    _detect_gpu_memory_linux, _detect_gpu_memory_windows, _list_devices_linux,
-    _resolve_gpu_layers, detect_device_memory, gguf_quant_preference, list_devices,
-    select_best_gguf,
-)
-from semantic_navigator.inference import (  # noqa: F401
-    _build_labels_schema, _create_cli_aspects, _create_embedding_model,
-    _create_local_aspects, _create_local_model, _create_openai_aspects,
-    _invoke_cli, _invoke_local, _invoke_openai, _local_complete,
-    _parse_raw_response, _validate_label_count, complete, initialize,
-    max_count_retries, max_retries,
-)
-from semantic_navigator.pipeline import (  # noqa: F401
-    _count_tree_depth, _count_tree_leaves, _embed_with_fastembed, _embed_with_openai,
-    _generate_paths, _label_cluster_node, _label_leaf_node, _read_file,
-    build_cluster_tree, cluster, count_cached_labels, embed, label_nodes,
-    max_clusters, max_leaves, to_files, to_pattern, tree,
-)
+from semantic_navigator.cache import content_hash, list_cached_keys, repo_cache_dir
+from semantic_navigator.gpu import list_devices
+from semantic_navigator.inference import initialize
+from semantic_navigator.models import Facets, Tree
+from semantic_navigator.pipeline import _generate_paths, embed, tree
+from semantic_navigator.util import _fmt_time, timed
 
 
 class UI(textual.app.App):
@@ -145,7 +121,7 @@ def _show_status(repository: str):
             with open(absolute_path, "rb") as f:
                 text = f.read().decode("utf-8")
             file_hashes.append((path, content_hash(f"{path}:\n\n{text}")))
-        except (UnicodeDecodeError, IsADirectoryError):
+        except (UnicodeDecodeError, IsADirectoryError, FileNotFoundError, PermissionError):
             pass
 
     total = len(file_hashes)
