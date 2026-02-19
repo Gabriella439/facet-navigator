@@ -341,12 +341,36 @@ def repair_json(text: str) -> str:
     text = re.sub(r'\\u(?![0-9a-fA-F]{4})', r'\\\\u', text)
     return text
 
-def _local_complete(model: object, prompt: str) -> str:
-    result = model.create_chat_completion(
-        messages = [{"role": "user", "content": prompt}],
-        temperature = 0.0,
-        max_tokens = 4096,
-    )
+def _build_labels_schema(count: int | None) -> dict:
+    """Build a JSON schema for Labels with optional exact item count."""
+    label_schema = {
+        "type": "object",
+        "properties": {
+            "overarchingTheme": {"type": "string"},
+            "distinguishingFeature": {"type": "string"},
+            "label": {"type": "string"},
+        },
+        "required": ["overarchingTheme", "distinguishingFeature", "label"],
+    }
+    array_schema: dict = {"type": "array", "items": label_schema}
+    if count is not None:
+        array_schema["minItems"] = count
+        array_schema["maxItems"] = count
+    return {
+        "type": "object",
+        "properties": {"labels": array_schema},
+        "required": ["labels"],
+    }
+
+def _local_complete(model: object, prompt: str, response_format: dict | None = None) -> str:
+    kwargs: dict = {
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.0,
+        "max_tokens": 4096,
+    }
+    if response_format is not None:
+        kwargs["response_format"] = response_format
+    result = model.create_chat_completion(**kwargs)
     return result["choices"][0]["message"]["content"]
 
 max_retries = 60
@@ -360,8 +384,14 @@ async def complete(facets: Facets, prompt: str, output_type: type[T], progress: 
         aspect = await facets.pool.acquire()
         try:
             if aspect.local_model is not None:
+                response_format = None
+                if expected_count is not None:
+                    response_format = {
+                        "type": "json_object",
+                        "schema": _build_labels_schema(expected_count),
+                    }
                 loop = asyncio.get_event_loop()
-                raw = await loop.run_in_executor(None, _local_complete, aspect.local_model, prompt)
+                raw = await loop.run_in_executor(None, _local_complete, aspect.local_model, prompt, response_format)
             else:
                 if facets.debug:
                     cmd = shlex.join(aspect.cli_command)
