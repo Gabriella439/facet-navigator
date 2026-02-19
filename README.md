@@ -14,12 +14,11 @@ Currently I've only built and run this script using uv and Nix.  However, you
 can feel free to submit pull requests for other installation instructions if
 you've vetted them.
 
-No matter what you do you will need to provide an `OPENAI_API_KEY` environment variable in
-order to use this script:
+You will need either a CLI AI tool installed and configured for authentication
+(any tool that reads from stdin and writes to stdout will work, e.g. `gemini`,
+`llm`, `aichat`), or you can use a local LLM via `--local` (see below).
 
-```ShellSession
-$ export OPENAI_API_KEY="$(< ./path/to/openai.key)"
-```
+Note: On first run, the embedding model (~130MB) will be downloaded automatically.
 
 ### uv
 
@@ -64,14 +63,49 @@ $ semantic-navigator ./path/to/repository
 ## Usage
 
 Depending on the size of the project it will probably take between a few
-seconds to a minute to produce a tree viewer.  Most of this delay is due to
-using `gpt-5-mini` by default to label clusters because `gpt-5-mini` has worse
-latency[^1], but is cheaper and still generally gives good results.  If you're
-willing to pay 7× as much to use a snappier and better model you can do this:
+seconds to a minute to produce a tree viewer.  You must specify which CLI tool
+to use via `--<tool>`:
 
 ```ShellSession
-$ semantic-navigator --completion-model gpt-5.2 ./path/to/repository
+# Gemini CLI
+$ semantic-navigator --gemini ./path/to/repository
+
+# Simon Willison's llm with GPT-4o
+$ semantic-navigator ./path/to/repository --llm -m gpt-4o
+
+# aichat
+$ semantic-navigator --aichat ./path/to/repository
 ```
+
+### Local LLM
+
+Instead of an external CLI tool, you can use a local GGUF model via
+`llama-cpp-python`. Install the optional dependency first:
+
+```ShellSession
+$ uv sync --extra local
+```
+
+Then use `--local` with either a local file path or a Hugging Face repo ID:
+
+```ShellSession
+# Local GGUF file
+$ semantic-navigator --local ./models/qwen2.5-7b-q4_k_m.gguf ./repo
+
+# Hugging Face repo (auto-downloads, default quantization: Q4_K_M)
+$ semantic-navigator --local Qwen/Qwen2.5-7B-Instruct-GGUF ./repo
+
+# Specific quantization
+$ semantic-navigator --local bartowski/Qwen2.5-7B-Instruct-GGUF --local-file "*Q8_0.gguf" ./repo
+
+# With GPU offloading (Vulkan on AMD, CUDA on NVIDIA)
+$ semantic-navigator --local Qwen/Qwen2.5-7B-Instruct-GGUF --gpu ./repo
+```
+
+When `--gpu` is used with `--local`, all model layers are offloaded to the GPU
+via whichever backend `llama-cpp-python` was compiled with (Vulkan, CUDA, etc.).
+The `--gpu` flag also enables DirectML for the embedding model (existing
+behavior).
 
 For small repositories (up to 20 files) you won't see any clusters and the tool
 will just summarize the individual files:
@@ -128,4 +162,4 @@ $ nix develop
 $ nix run . -- ./path/to/repository
 ```
 
-[^1]: OpenAI advertises `gpt-5-mini` as faster than `gpt-5*` models, but I see significantly worse latency for completions requests using `gpt-5-mini` which  matters more for this project's purposes.  The completions model is only being used to generate short labels where inference throughput does not matter that much.                                                                          
+Embeddings are generated locally using [fastembed](https://github.com/qdrant/fastembed) (ONNX-based), so no API key is needed for the embedding step.

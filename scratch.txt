@@ -13,9 +13,9 @@ FIXED in comprehensive remediation commit:
 - [x] Batch dispatch now concurrent via asyncio.gather
 - [x] HF API query now shows feedback message
 
-REMAINING (not yet addressed):
-- complete() releases broken aspects back to pool
-- count_llm_calls reads label cache from disk per-file (could use manifest)
-- Embedding cache does per-file path.exists()
-- list_devices() / detect_device_memory() GPU detection is Windows-only for GPU
-- Tree UI has no search/filter for large repos
+FIXED in remaining remediation:
+- [x] complete() now removes crashed aspects from pool instead of re-releasing them
+- [x] count_llm_calls uses directory listing set instead of per-file disk reads
+- [x] Embedding cache uses directory listing set to avoid per-file path.exists()
+- [x] Added Linux GPU detection via nvidia-smi and rocm-smi
+- [x] Tree UI now has search/filter (press / to search, Escape to clear)

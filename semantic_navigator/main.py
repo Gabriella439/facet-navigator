@@ -15,10 +15,12 @@ import shutil
 import sklearn
 import subprocess
 import sys
+import time
 import textual
 import textual.app
 import textual.widgets
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from dulwich.errors import NotGitRepository
 from dulwich.repo import Repo
@@ -33,6 +35,23 @@ from tqdm.asyncio import tqdm_asyncio
 from typing import Iterable, TypeVar
 
 T = TypeVar("T", bound=BaseModel)
+
+def _fmt_time(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes = int(seconds // 60)
+    secs = seconds % 60
+    return f"{minutes}m {secs:.0f}s"
+
+@contextmanager
+def timed(label: str, timings: dict[str, float] | None = None):
+    """Context manager that prints elapsed time for a phase."""
+    start = time.monotonic()
+    yield
+    elapsed = time.monotonic() - start
+    print(f"{label} ({_fmt_time(elapsed)})")
+    if timings is not None:
+        timings[label] = elapsed
 
 max_clusters = 20
 
@@ -81,15 +100,18 @@ class Facets:
     debug: bool
 
 def list_devices():
-    result = subprocess.run(
-        ["powershell", "-Command",
-         "Get-CimInstance Win32_VideoController | Select-Object -Property Name"],
-        capture_output = True, text = True
-    )
-    names = [
-        line.strip() for line in result.stdout.strip().splitlines()
-        if line.strip() and line.strip() != "Name" and not line.strip().startswith("----")
-    ]
+    if sys.platform == "win32":
+        result = subprocess.run(
+            ["powershell", "-Command",
+             "Get-CimInstance Win32_VideoController | Select-Object -Property Name"],
+            capture_output = True, text = True
+        )
+        names = [
+            line.strip() for line in result.stdout.strip().splitlines()
+            if line.strip() and line.strip() != "Name" and not line.strip().startswith("----")
+        ]
+    else:
+        names = _list_devices_linux()
     print("GPU devices:")
     for i, name in enumerate(names):
         vram = detect_device_memory(True, i)
@@ -97,6 +119,35 @@ def list_devices():
             print(f"  {i}: {name} ({vram / 1e9:.1f} GB)")
         else:
             print(f"  {i}: {name} (unknown VRAM)")
+
+def _list_devices_linux() -> list[str]:
+    """List GPU device names on Linux via nvidia-smi or rocm-smi."""
+    names: list[str] = []
+    # Try NVIDIA first
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            names.extend(line.strip() for line in result.stdout.strip().splitlines() if line.strip())
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    # Try AMD ROCm
+    try:
+        result = subprocess.run(
+            ["rocm-smi", "--showproductname"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                # rocm-smi output: "GPU[0]  : Card series:  AMD Radeon ..."
+                match = re.search(r"Card series:\s*(.+)", line)
+                if match:
+                    names.append(match.group(1).strip())
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return names
 
 def case_insensitive_glob(pattern: str) -> str:
     return ''.join(
@@ -154,26 +205,63 @@ def _detect_gpu_memory_windows() -> list[int | None]:
 
 _gpu_memory_cache: list[int | None] | None = None
 
+def _detect_gpu_memory_linux() -> list[int | None]:
+    """Detect VRAM for all GPUs on Linux via nvidia-smi and rocm-smi."""
+    values: list[int | None] = []
+    # Try NVIDIA
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            for line in result.stdout.strip().splitlines():
+                line = line.strip()
+                if line:
+                    try:
+                        values.append(int(line) * 1024 * 1024)  # MiB to bytes
+                    except ValueError:
+                        values.append(None)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    # Try AMD ROCm
+    try:
+        result = subprocess.run(
+            ["rocm-smi", "--showmeminfo", "vram"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                # "GPU[0]  : VRAM Total Memory (B): 17163091968"
+                match = re.search(r"VRAM Total Memory \(B\):\s*(\d+)", line)
+                if match:
+                    values.append(int(match.group(1)))
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return values
+
 def detect_device_memory(gpu: bool, device: int) -> int | None:
     """Detect memory in bytes for the target device. Returns None if unknown."""
     global _gpu_memory_cache
     try:
-        if sys.platform == "win32":
-            if gpu:
-                if _gpu_memory_cache is None:
+        if gpu:
+            if _gpu_memory_cache is None:
+                if sys.platform == "win32":
                     _gpu_memory_cache = _detect_gpu_memory_windows()
-                if device < len(_gpu_memory_cache):
-                    return _gpu_memory_cache[device]
-                return None
-            else:
+                else:
+                    _gpu_memory_cache = _detect_gpu_memory_linux()
+            if device < len(_gpu_memory_cache):
+                return _gpu_memory_cache[device]
+            return None
+        else:
+            if sys.platform == "win32":
                 result = subprocess.run(
                     ["powershell", "-Command",
                      "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory"],
                     capture_output=True, text=True, timeout=10,
                 )
                 return int(result.stdout.strip())
-        else:
-            if not gpu:
+            else:
                 return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
     except (ValueError, OSError, subprocess.TimeoutExpired, AttributeError):
         pass
@@ -435,6 +523,7 @@ async def complete(facets: Facets, prompt: str, output_type: type[T], progress: 
         if facets.debug:
             print(f"\n[debug] prompt ({len(prompt)} chars):\n{prompt[:500]}{'...' if len(prompt) > 500 else ''}")
         aspect = await facets.pool.acquire()
+        release_aspect = True
         try:
             if aspect.local_model is not None:
                 response_format = None
@@ -466,8 +555,20 @@ async def complete(facets: Facets, prompt: str, output_type: type[T], progress: 
                     raise RuntimeError(
                         f"CLI command failed (exit {result.returncode}): {result.stderr.decode()}"
                     )
+        except (RuntimeError, OSError, subprocess.TimeoutExpired) as e:
+            # Model crash or CLI failure — don't return this aspect to the pool
+            release_aspect = False
+            remaining = [a for a in facets.pool.aspects if a is not aspect]
+            if not remaining:
+                raise SystemExit(f"All inference backends have failed. Last error: {e}")
+            facets.pool.aspects = remaining
+            tqdm.write(f"Aspect {aspect.name} failed permanently ({e}), removed from pool ({len(remaining)} remaining)")
+            if attempt < max_retries - 1:
+                continue
+            raise
         finally:
-            facets.pool.release(aspect)
+            if release_aspect:
+                facets.pool.release(aspect)
         if facets.debug:
             print(f"[debug] raw output ({len(raw)} chars):\n{raw[:500]}{'...' if len(raw) > 500 else ''}")
         extracted = extract_json(raw)
@@ -483,15 +584,15 @@ async def complete(facets: Facets, prompt: str, output_type: type[T], progress: 
                 result = output_type.model_validate_json(repaired)
             except Exception as e:
                 if attempt < max_retries - 1:
-                    tqdm.write(f"Retrying ({attempt + 1}/{max_retries}): {e}")
+                    tqdm.write(f"[{aspect.name}] Retry {attempt + 1}/{max_retries}: parse error: {e}")
                     continue
                 raise
         if expected_count is not None and hasattr(result, 'labels') and len(result.labels) != expected_count:
             if len(result.labels) > expected_count:
-                tqdm.write(f"Truncating {len(result.labels)} labels to {expected_count}")
+                tqdm.write(f"[{aspect.name}] Truncating {len(result.labels)} → {expected_count} labels")
                 result.labels = result.labels[:expected_count]
             elif attempt < max_count_retries - 1:
-                tqdm.write(f"Retrying ({attempt + 1}/{max_count_retries}): expected {expected_count} labels, got {len(result.labels)}")
+                tqdm.write(f"[{aspect.name}] Retry {attempt + 1}/{max_count_retries}: expected {expected_count} labels, got {len(result.labels)}")
                 continue
             else:
                 # Pad with generic labels rather than retrying forever
@@ -535,6 +636,12 @@ def content_hash(content: str) -> str:
 def embedding_cache_dir(model_name: str) -> Path:
     return app_cache_dir() / "embeddings" / model_name.replace("/", "--")
 
+def list_cached_keys(directory: Path, suffix: str) -> set[str]:
+    """List all cached keys in a directory by stripping the suffix from filenames."""
+    if not directory.exists():
+        return set()
+    return {p.stem for p in directory.iterdir() if p.suffix == suffix}
+
 def load_cached_embedding(directory: Path, key: str) -> NDArray[float32] | None:
     path = directory / f"{key}.npy"
     if path.exists():
@@ -559,6 +666,24 @@ def save_cached_label(directory: Path, key: str, label: Label) -> None:
     directory.mkdir(parents = True, exist_ok = True)
     path = directory / f"{key}.json"
     path.write_text(label.model_dump_json())
+
+def cluster_hash(files: list[str]) -> str:
+    """Stable hash for a cluster based on its sorted file list."""
+    return hashlib.sha256("\n".join(sorted(files)).encode()).hexdigest()
+
+def load_cached_cluster_labels(directory: Path, key: str) -> Labels | None:
+    path = directory / f"cluster-{key}.json"
+    if path.exists():
+        try:
+            return Labels.model_validate_json(path.read_text())
+        except Exception:
+            return None
+    return None
+
+def save_cached_cluster_labels(directory: Path, key: str, labels: Labels) -> None:
+    directory.mkdir(parents = True, exist_ok = True)
+    path = directory / f"cluster-{key}.json"
+    path.write_text(labels.model_dump_json())
 
 @dataclass(frozen = True)
 class Embed:
@@ -633,19 +758,20 @@ async def embed(facets: Facets, directory: str) -> Cluster:
     paths, contents = zip(*results)
 
     cdir = embedding_cache_dir(facets.embedding_model_name)
+    cached_emb_keys = list_cached_keys(cdir, ".npy")
     embeddings: list[NDArray[float32]] = [None] * len(contents)  # type: ignore[list-item]
     uncached_indices = []
 
     for i, content in enumerate(contents):
-        cached = load_cached_embedding(cdir, content_hash(content))
-        if cached is not None:
-            embeddings[i] = cached
+        key = content_hash(content)
+        if key in cached_emb_keys:
+            embeddings[i] = load_cached_embedding(cdir, key)
         else:
             uncached_indices.append(i)
 
     n_cached = len(contents) - len(uncached_indices)
     if n_cached > 0:
-        print(f"Loaded {n_cached}/{len(contents)} embeddings from cache")
+        print(f"Embeddings: {n_cached}/{len(contents)} cached, {len(uncached_indices)} to compute")
 
     if uncached_indices:
         uncached_contents = [contents[i] for i in uncached_indices]
@@ -866,6 +992,16 @@ class ClusterTree:
     node: Cluster
     children: list["ClusterTree"]
 
+def _count_tree_depth(ct: ClusterTree) -> int:
+    if not ct.children:
+        return 0
+    return 1 + max(_count_tree_depth(c) for c in ct.children)
+
+def _count_tree_leaves(ct: ClusterTree) -> int:
+    if not ct.children:
+        return 1
+    return sum(_count_tree_leaves(c) for c in ct.children)
+
 def build_cluster_tree(c: Cluster) -> ClusterTree:
     children = cluster(c)
     if len(children) == 1:
@@ -908,25 +1044,33 @@ def to_pattern(files: list[str]) -> str:
 def to_files(trees: list[Tree]) -> list[str]:
     return [ file for tree in trees for file in tree.files ]
 
-def count_llm_calls(ct: ClusterTree, repository: str, model_identity: str) -> tuple[int, int]:
-    """Count how many LLM calls will be needed.
-    Returns (total_calls, cached_file_labels)."""
+def count_cached_labels(ct: ClusterTree, repository: str, model_identity: str, cached_keys: set[str] | None = None) -> tuple[int, int, int]:
+    """Count cached vs uncached file labels in the tree.
+    Returns (uncached_files, cached_files, cached_clusters)."""
+    if cached_keys is None:
+        cached_keys = list_cached_keys(label_cache_dir(repository, model_identity), ".json")
     if not ct.children:
-        ldir = label_cache_dir(repository, model_identity)
         uncached = sum(
             1 for embed in ct.node.embeds
-            if load_cached_label(ldir, content_hash(embed.content)) is None
+            if content_hash(embed.content) not in cached_keys
         )
         cached = len(ct.node.embeds) - uncached
-        return (1 if uncached > 0 else 0, cached)
+        return (uncached, cached, 0)
     else:
-        total = 0
+        total_uncached = 0
         total_cached = 0
+        total_cached_clusters = 0
         for child in ct.children:
-            calls, cached = count_llm_calls(child, repository, model_identity)
-            total += calls
+            uncached, cached, cc = count_cached_labels(child, repository, model_identity, cached_keys)
+            total_uncached += uncached
             total_cached += cached
-        return (total + 1, total_cached)  # +1 for cluster summarization
+            total_cached_clusters += cc
+        # Check if this cluster node itself is cached
+        all_files = [e.entry for e in ct.node.embeds]
+        c_key = "cluster-" + cluster_hash(all_files)
+        if c_key in cached_keys:
+            total_cached_clusters += 1
+        return (total_uncached, total_cached, total_cached_clusters)
 
 async def label_nodes(facets: Facets, ct: ClusterTree, progress: tqdm) -> list[Tree]:
     if not ct.children:
@@ -974,6 +1118,9 @@ async def label_nodes(facets: Facets, ct: ClusterTree, progress: tqdm) -> list[T
 
                 batches = [uncached_embeds]
 
+            batch_sizes = [len(b) for b in batches]
+            tqdm.write(f"  Leaf: {len(uncached_embeds)} files in {len(batches)} batch{'es' if len(batches) != 1 else ''} (avg {sum(batch_sizes)/len(batch_sizes):.1f} files/batch)")
+
             schema = json.dumps(Labels.model_json_schema(), indent=2)
 
             async def process_batch(batch: list[tuple[int, Embed]]) -> None:
@@ -990,6 +1137,7 @@ async def label_nodes(facets: Facets, ct: ClusterTree, progress: tqdm) -> list[T
 
                 for (i, embed), label in zip(batch, result.labels):
                     cached_labels[i] = label
+                    # Save each file label immediately so progress survives crashes
                     save_cached_label(ldir, content_hash(embed.content), label)
 
             await asyncio.gather(*(process_batch(batch) for batch in batches))
@@ -1008,6 +1156,21 @@ async def label_nodes(facets: Facets, ct: ClusterTree, progress: tqdm) -> list[T
             *(label_nodes(facets, child, progress) for child in ct.children),
         )
 
+        # Check cluster label cache
+        ldir = label_cache_dir(facets.repository, facets.model_identity)
+        all_files = [f for trees in treess for tree in trees for f in tree.files]
+        c_key = cluster_hash(all_files)
+        cached_cluster = load_cached_cluster_labels(ldir, c_key)
+
+        if cached_cluster is not None and len(cached_cluster.labels) == len(treess):
+            tqdm.write(f"  Cluster ({len(treess)} children): cached")
+            if progress is not None:
+                progress.update(1)
+            return [
+                Tree(f"{to_pattern(to_files(trees))}{label.label}", to_files(trees), trees)
+                for label, trees in zip(cached_cluster.labels, treess)
+            ]
+
         def render_cluster(trees: list[Tree]) -> str:
             rendered_trees = "\n".join([ tree.label for tree in trees ])
 
@@ -1025,45 +1188,89 @@ async def label_nodes(facets: Facets, ct: ClusterTree, progress: tqdm) -> list[T
 
         labels = await complete(facets, prompt, Labels, progress, expected_count=len(treess))
 
+        # Cache cluster labels for crash recovery
+        save_cached_cluster_labels(ldir, c_key, labels)
+
         return [
             Tree(f"{to_pattern(to_files(trees))}{label.label}", to_files(trees), trees)
             for label, trees in zip(labels.labels, treess)
         ]
 
-async def tree(facets: Facets, label: str, c: Cluster) -> Tree:
-    ct = build_cluster_tree(c)
-    total_calls, cached_labels = count_llm_calls(ct, facets.repository, facets.model_identity)
-    if cached_labels > 0:
-        print(f"Loaded {cached_labels} file labels from cache", flush=True)
-    if total_calls > 0:
-        print(f"Labeling with {total_calls} API call{'s' if total_calls != 1 else ''}...", flush=True)
-    with tqdm(total = total_calls, desc = "Labeling", unit = "call", leave = False) as progress:
-        children = await label_nodes(facets, ct, progress)
+async def tree(facets: Facets, label: str, c: Cluster, timings: dict[str, float] | None = None) -> Tree:
+    with timed("Clustering", timings):
+        ct = build_cluster_tree(c)
+    depth = _count_tree_depth(ct)
+    leaves = _count_tree_leaves(ct)
+    print(f"  {leaves} leaf clusters, depth {depth}")
+    uncached_files, cached_files, cached_clusters = count_cached_labels(ct, facets.repository, facets.model_identity)
+    total_files = cached_files + uncached_files
+    cache_parts = []
+    if cached_files > 0:
+        cache_parts.append(f"{cached_files}/{total_files} file labels")
+    if cached_clusters > 0:
+        cache_parts.append(f"{cached_clusters} cluster labels")
+    if cache_parts:
+        print(f"Cache: {', '.join(cache_parts)}", flush=True)
+    if uncached_files > 0:
+        print(f"Labeling {uncached_files} uncached files...", flush=True)
+    with timed("Labeling", timings):
+        with tqdm(desc = "Labeling", unit = "call", leave = False) as progress:
+            children = await label_nodes(facets, ct, progress)
 
     return Tree(label, to_files(children), children)
 
 class UI(textual.app.App):
+    BINDINGS = [("slash", "focus_search", "Search"), ("escape", "clear_search", "Clear")]
+
     def __init__(self, tree_):
         super().__init__()
         self.tree_ = tree_
 
     async def on_mount(self):
+        self.search_input = textual.widgets.Input(placeholder="Search (press / to focus)...")
+        self.search_input.display = False
         self.treeview = textual.widgets.Tree(f"{self.tree_.label} ({len(self.tree_.files)})")
+        self._build_tree()
+        await self.mount(self.search_input)
+        await self.mount(self.treeview)
+
+    def _build_tree(self, filter_text: str = ""):
+        self.treeview.clear()
+        self.treeview.root.set_label(f"{self.tree_.label} ({len(self.tree_.files)})")
+
+        def matches(child: Tree, text: str) -> bool:
+            if text in child.label.lower():
+                return True
+            return any(text in f.lower() for f in child.files)
 
         def loop(node, children):
             for child in children:
+                if filter_text and not matches(child, filter_text):
+                    continue
                 if len(child.files) <= 1:
                     n = node.add(child.label)
                     n.allow_expand = False
                 else:
                     n = node.add(f"{child.label} ({len(child.files)})")
                     n.allow_expand = True
-
                     loop(n, child.children)
 
         loop(self.treeview.root, self.tree_.children)
+        if filter_text:
+            self.treeview.root.expand_all()
 
-        self.mount(self.treeview)
+    def action_focus_search(self):
+        self.search_input.display = True
+        self.search_input.focus()
+
+    def action_clear_search(self):
+        self.search_input.value = ""
+        self.search_input.display = False
+        self._build_tree()
+        self.treeview.focus()
+
+    def on_input_changed(self, event: textual.widgets.Input.Changed):
+        self._build_tree(event.value.strip().lower())
 
 def main():
     parser = argparse.ArgumentParser(
@@ -1204,12 +1411,18 @@ def main():
     facets = initialize(arguments.repository, model_identity, cli_command, arguments.local, arguments.local_file, arguments.embedding_model, arguments.gpu, arguments.cpu, arguments.cpu_offload, devices, arguments.gpu_layers, arguments.batch_size, arguments.concurrency, arguments.n_ctx, arguments.timeout, arguments.debug)
 
     async def async_tasks():
-        initial_cluster = await embed(facets, arguments.repository)
+        timings: dict[str, float] = {}
+        total_start = time.monotonic()
 
-        print(f"Clustering {len(initial_cluster.embeds)} files...")
-        tree_ = await tree(facets, arguments.repository, initial_cluster)
+        with timed("Reading & embedding", timings):
+            initial_cluster = await embed(facets, arguments.repository)
 
-        print("Done!")
+        print(f"Processing {len(initial_cluster.embeds)} files...")
+        tree_ = await tree(facets, arguments.repository, initial_cluster, timings)
+
+        total = time.monotonic() - total_start
+        parts = " | ".join(f"{k}: {_fmt_time(v)}" for k, v in timings.items())
+        print(f"Done! Total: {_fmt_time(total)} ({parts})")
         return tree_
 
     tree_ = asyncio.run(async_tasks())
