@@ -1162,7 +1162,7 @@ def main():
         parser.error(f"--device must be comma-separated integers, got: {arguments.device}")
 
     if arguments.n_ctx is None:
-        arguments.n_ctx = 4096
+        arguments.n_ctx = 8192
     if arguments.concurrency is None:
         arguments.concurrency = 4
 
