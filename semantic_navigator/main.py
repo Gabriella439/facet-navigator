@@ -403,10 +403,15 @@ async def complete(facets: Facets, prompt: str, output_type: type[T], progress: 
                     continue
                 raise
         if expected_count is not None and hasattr(result, 'labels') and len(result.labels) != expected_count:
-            if attempt < max_retries - 1:
+            if len(result.labels) > expected_count:
+                # Too many labels — truncate to expected count
+                tqdm.write(f"Truncating {len(result.labels)} labels to {expected_count}")
+                result.labels = result.labels[:expected_count]
+            elif attempt < max_retries - 1:
                 tqdm.write(f"Retrying ({attempt + 1}/{max_retries}): expected {expected_count} labels, got {len(result.labels)}")
                 continue
-            tqdm.write(f"Warning: expected {expected_count} labels, got {len(result.labels)} after {max_retries} attempts")
+            else:
+                tqdm.write(f"Warning: expected {expected_count} labels, got {len(result.labels)} after {max_retries} attempts")
         if progress is not None:
             progress.update(1)
         return result
