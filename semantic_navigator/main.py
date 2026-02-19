@@ -110,26 +110,61 @@ gguf_quant_preference = [
     "fp16", "f16",
 ]
 
+def _detect_gpu_memory_windows() -> list[int | None]:
+    """Detect VRAM for all GPUs on Windows, ordered by WMI device index.
+    Correlates WMI PNPDeviceID with registry MatchingDeviceId to find
+    64-bit memory values (AdapterRAM is only 32-bit and overflows >4GB)."""
+    # Get PNPDeviceIDs in WMI order
+    script = (
+        "$pnps = (Get-CimInstance Win32_VideoController).PNPDeviceID;"
+        "$base = 'HKLM:\\SYSTEM\\ControlSet001\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}';"
+        "$map = @{};"
+        "foreach ($i in 0..20) {"
+        "  $p = \"$base\\\" + $i.ToString('D4');"
+        "  if (Test-Path $p) {"
+        "    $props = Get-ItemProperty $p -ErrorAction SilentlyContinue;"
+        "    if ($props.MatchingDeviceId -and $props.'HardwareInformation.qwMemorySize') {"
+        "      $map[$props.MatchingDeviceId] = $props.'HardwareInformation.qwMemorySize'"
+        "    }"
+        "  }"
+        "};"
+        "foreach ($pnp in $pnps) {"
+        "  $found = $false;"
+        "  foreach ($key in $map.Keys) {"
+        "    if ($pnp -like \"$key*\") { Write-Host $map[$key]; $found = $true; break }"
+        "  };"
+        "  if (-not $found) { Write-Host 'None' }"
+        "}"
+    )
+    result = subprocess.run(
+        ["powershell", "-Command", script],
+        capture_output=True, text=True, timeout=15,
+    )
+    values: list[int | None] = []
+    for line in result.stdout.strip().splitlines():
+        line = line.strip()
+        if line and line != "None":
+            try:
+                values.append(int(line))
+            except ValueError:
+                values.append(None)
+        else:
+            values.append(None)
+    return values
+
+_gpu_memory_cache: list[int | None] | None = None
+
 def detect_device_memory(gpu: bool, device: int) -> int | None:
     """Detect memory in bytes for the target device. Returns None if unknown."""
+    global _gpu_memory_cache
     try:
         if sys.platform == "win32":
             if gpu:
-                reg_path = (
-                    "HKLM:\\SYSTEM\\ControlSet001\\Control\\Class\\"
-                    f"{{4d36e968-e325-11ce-bfc1-08002be10318}}\\{device:04d}"
-                )
-                result = subprocess.run(
-                    ["powershell", "-Command",
-                     f"(Get-ItemProperty '{reg_path}'"
-                     " -Name 'HardwareInformation.qwMemorySize'"
-                     " -ErrorAction SilentlyContinue)."
-                     "'HardwareInformation.qwMemorySize'"],
-                    capture_output=True, text=True, timeout=10,
-                )
-                value = result.stdout.strip()
-                if value:
-                    return int(value)
+                if _gpu_memory_cache is None:
+                    _gpu_memory_cache = _detect_gpu_memory_windows()
+                if device < len(_gpu_memory_cache):
+                    return _gpu_memory_cache[device]
+                return None
             else:
                 result = subprocess.run(
                     ["powershell", "-Command",
